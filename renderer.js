@@ -4,6 +4,11 @@ const hljs = require('highlight.js');
 
 let currentSessions = [];
 let currentSessionId = null;
+let currentSessionSource = 'claude';
+let currentSessionLocator = null;
+let refreshIntervalId = null;
+let isLoadingSessions = false;
+let isLoadingSessionDetails = false;
 
 // Configure marked for syntax highlighting
 marked.setOptions({
@@ -188,11 +193,14 @@ function truncateProject(project) {
 }
 
 // Load sessions from Claude Code history
-async function loadSessions() {
+async function loadSessions(options = {}) {
   const sessionList = document.getElementById('sessionList');
   const sessionCount = document.getElementById('sessionCount');
 
   try {
+    if (isLoadingSessions) return;
+    isLoadingSessions = true;
+
     const result = await ipcRenderer.invoke('get-sessions');
 
     if (result.error) {
@@ -213,7 +221,7 @@ async function loadSessions() {
 
     // Render session list
     sessionList.innerHTML = currentSessions.map((session, index) => `
-      <div class="session-item" data-session-id="${session.id}" data-project-dir="${session.projectDir}">
+      <div class="session-item" data-session-id="${session.id}" data-locator="${escapeHtml(session.locator || '')}" data-source="${escapeHtml(session.source || 'claude')}">
         <div class="session-timestamp">${formatTimestamp(session.timestamp)}</div>
         <div class="session-preview">${escapeHtml(session.display)}</div>
         <div class="session-meta">
@@ -227,8 +235,10 @@ async function loadSessions() {
     document.querySelectorAll('.session-item').forEach(item => {
       item.addEventListener('click', () => {
         const sessionId = item.getAttribute('data-session-id');
-        const projectDir = item.getAttribute('data-project-dir');
-        loadSessionDetails(sessionId, projectDir);
+        const locator = item.getAttribute('data-locator');
+        const source = item.getAttribute('data-source') || 'claude';
+        currentSessionLocator = locator;
+        loadSessionDetails(sessionId, locator, source);
 
         // Update active state
         document.querySelectorAll('.session-item').forEach(i => i.classList.remove('active'));
@@ -236,40 +246,61 @@ async function loadSessions() {
       });
     });
 
+    // Preserve the active selection across refreshes.
+    if (currentSessionId && currentSessionSource) {
+      const selected = document.querySelector(
+        `.session-item[data-session-id="${CSS.escape(currentSessionId)}"][data-source="${CSS.escape(currentSessionSource)}"]`
+      );
+      if (selected) selected.classList.add('active');
+    }
+
   } catch (error) {
     sessionList.innerHTML = `<div class="error-message">Error: ${error.message}</div>`;
     sessionCount.textContent = 'Error';
+  } finally {
+    isLoadingSessions = false;
   }
 }
 
 // Load full session conversation
-async function loadSessionDetails(sessionId, projectDir) {
+async function loadSessionDetails(sessionId, locator, source, options = {}) {
   const chatContainer = document.getElementById('chatContainer');
   const chatHeader = document.getElementById('chatHeader');
 
   currentSessionId = sessionId;
+  currentSessionSource = source || 'claude';
+  currentSessionLocator = locator;
 
-  // Show loading state
-  chatContainer.innerHTML = '<div class="loading">Loading conversation...</div>';
+  if (isLoadingSessionDetails) return;
+  isLoadingSessionDetails = true;
+
+  const prevScrollTop = chatContainer.scrollTop;
+  const preserveScroll = !!options.preserveScroll;
+
+  // Show loading state (skip during background refresh)
+  if (!options.silent) {
+    chatContainer.innerHTML = '<div class="loading">Loading conversation...</div>';
+  }
 
   try {
-    const result = await ipcRenderer.invoke('get-session-details', sessionId, projectDir);
+    const result = await ipcRenderer.invoke('get-session-details', sessionId, locator, currentSessionSource);
 
     if (result.error) {
       chatContainer.innerHTML = `<div class="error-message">${result.error}</div>`;
       return;
     }
 
-    const session = currentSessions.find(s => s.id === sessionId);
+    const session = currentSessions.find(s => s.id === sessionId && (s.source || 'claude') === currentSessionSource);
+    const assistantName = currentSessionSource === 'codex' ? 'Codex' : 'Claude';
 
     // Update header
     chatHeader.innerHTML = `
       <div class="session-header">
-        <div class="session-title">${escapeHtml(session.display)}</div>
+        <div class="session-title">${escapeHtml(session ? session.display : '')}</div>
         <div class="session-info">
-          <span>${formatTimestamp(session.timestamp)}</span>
+          <span>${session ? formatTimestamp(session.timestamp) : ''}</span>
           <span>•</span>
-          <span>${escapeHtml(session.project)}</span>
+          <span>${escapeHtml(session ? session.project : '')}</span>
           <span>•</span>
           <span>${result.messages.length} messages</span>
         </div>
@@ -306,7 +337,7 @@ async function loadSessionDetails(sessionId, projectDir) {
       return `
         <div class="message ${msg.role}">
           <div class="message-header">
-            <div class="message-role ${msg.role}">${msg.role === 'user' ? 'You' : 'Claude'}</div>
+            <div class="message-role ${msg.role}">${msg.role === 'user' ? 'You' : assistantName}</div>
             <div class="message-timestamp">${formatMessageTimestamp(msg.timestamp)}</div>
           </div>
           ${contentSection}
@@ -318,11 +349,13 @@ async function loadSessionDetails(sessionId, projectDir) {
 
     attachFileHistoryHandlers(chatContainer);
 
-    // Scroll to top
-    chatContainer.scrollTop = 0;
+    // Keep scroll position for background refreshes.
+    chatContainer.scrollTop = preserveScroll ? Math.min(prevScrollTop, chatContainer.scrollHeight) : 0;
 
   } catch (error) {
     chatContainer.innerHTML = `<div class="error-message">Error loading conversation: ${error.message}</div>`;
+  } finally {
+    isLoadingSessionDetails = false;
   }
 }
 
@@ -336,4 +369,25 @@ function escapeHtml(text) {
 // Initialize on load
 window.addEventListener('DOMContentLoaded', () => {
   loadSessions();
+
+  // Periodically refresh the session list and the currently open conversation.
+  // Keep this in the renderer so it updates even if the main process stays unchanged.
+  refreshIntervalId = setInterval(async () => {
+    try {
+      await loadSessions({ silent: true });
+      if (currentSessionId && currentSessionLocator && currentSessionSource) {
+        await loadSessionDetails(currentSessionId, currentSessionLocator, currentSessionSource, {
+          preserveScroll: true,
+          silent: true
+        });
+      }
+    } catch (e) {
+      // Ignore periodic refresh errors; the UI will surface errors when user interacts.
+    }
+  }, 15000);
+});
+
+window.addEventListener('beforeunload', () => {
+  if (refreshIntervalId) clearInterval(refreshIntervalId);
+  refreshIntervalId = null;
 });

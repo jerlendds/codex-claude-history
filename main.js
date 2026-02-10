@@ -13,6 +13,11 @@ function getClaudeConfigPath() {
   }
 }
 
+function getCodexConfigPath() {
+  // User requested explicit support for ~/.codex
+  return path.join(os.homedir(), '.codex');
+}
+
 function safeJsonParse(line) {
   try {
     return JSON.parse(line);
@@ -34,6 +39,75 @@ function extractTextContent(message) {
   }
 
   return '';
+}
+
+function extractCodexTextFromContentBlocks(content) {
+  if (!content) return '';
+
+  if (typeof content === 'string') return content;
+
+  if (Array.isArray(content)) {
+    return content
+      .map(block => {
+        if (!block || typeof block !== 'object') return '';
+        if (typeof block.text === 'string') return block.text;
+        if (typeof block.content === 'string') return block.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n\n');
+  }
+
+  return '';
+}
+
+function tryExtractCwdFromEnvText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const m = text.match(/<cwd>([^<]+)<\/cwd>/);
+  return m ? m[1] : null;
+}
+
+function isProbablyEnvironmentContextText(text) {
+  if (!text || typeof text !== 'string') return false;
+  const t = text.trim();
+  return t.startsWith('<environment_context>') || t.includes('<environment_context>');
+}
+
+function unwrapCodexRecord(obj) {
+  // Codex has at least two observed on-disk formats:
+  // 1) Old: { type: "message" | "function_call" | ... }
+  // 2) New: { type: "response_item", timestamp, payload: { type: "message" | "function_call" | ... } }
+  if (!obj || typeof obj !== 'object') return { timestamp: null, rec: null };
+  if (obj.type === 'response_item' && obj.payload && typeof obj.payload === 'object') {
+    return { timestamp: obj.timestamp || null, rec: obj.payload };
+  }
+  return { timestamp: obj.timestamp || null, rec: obj };
+}
+
+function listFilesRecursive(baseDir, predicate) {
+  const results = [];
+  if (!fs.existsSync(baseDir)) return results;
+
+  const stack = [baseDir];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const ent of entries) {
+      const p = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        stack.push(p);
+      } else if (ent.isFile()) {
+        if (!predicate || predicate(p)) results.push(p);
+      }
+    }
+  }
+
+  return results;
 }
 
 function createWindow() {
@@ -70,78 +144,219 @@ app.on('window-all-closed', () => {
 // IPC handlers for reading session data
 ipcMain.handle('get-sessions', async () => {
   try {
-    const configPath = getClaudeConfigPath();
-    const historyPath = path.join(configPath, 'history.jsonl');
-    const projectsPath = path.join(configPath, 'projects');
+    const sessions = [];
 
-    if (!fs.existsSync(historyPath)) {
-      return { error: 'History file not found at: ' + historyPath };
-    }
+    // Claude Code sessions (existing behavior)
+    try {
+      const configPath = getClaudeConfigPath();
+      const historyPath = path.join(configPath, 'history.jsonl');
+      const projectsPath = path.join(configPath, 'projects');
 
-    // Read history.jsonl to get all user prompts
-    const historyContent = fs.readFileSync(historyPath, 'utf-8');
-    const historyLines = historyContent.trim().split('\n').filter(line => line.trim());
+      const sessionMap = new Map();
 
-    // Parse history entries
-    const historyEntries = historyLines.map(line => {
-      return safeJsonParse(line);
-    }).filter(entry => entry !== null);
+      // Read all session files from projects directory
+      if (fs.existsSync(projectsPath)) {
+        const projectDirs = fs.readdirSync(projectsPath);
 
-    // Group by project and timestamp to identify sessions
-    const sessionMap = new Map();
+        for (const projectDir of projectDirs) {
+          const projectPath = path.join(projectsPath, projectDir);
+          let stat;
+          try {
+            stat = fs.statSync(projectPath);
+          } catch {
+            continue;
+          }
 
-    // Read all session files from projects directory
-    if (fs.existsSync(projectsPath)) {
-      const projectDirs = fs.readdirSync(projectsPath);
+          if (stat.isDirectory()) {
+            const sessionFiles = fs
+              .readdirSync(projectPath)
+              .filter(f => f.endsWith('.jsonl') && !f.startsWith('agent-'));
 
-      for (const projectDir of projectDirs) {
-        const projectPath = path.join(projectsPath, projectDir);
-        const stat = fs.statSync(projectPath);
+            for (const sessionFile of sessionFiles) {
+              const sessionPath = path.join(projectPath, sessionFile);
+              const sessionId = sessionFile.replace('.jsonl', '');
 
-        if (stat.isDirectory()) {
-          const sessionFiles = fs.readdirSync(projectPath).filter(f => f.endsWith('.jsonl') && !f.startsWith('agent-'));
+              try {
+                const sessionContent = fs.readFileSync(sessionPath, 'utf-8');
+                const lines = sessionContent.trim().split('\n').filter(line => line.trim());
 
-          for (const sessionFile of sessionFiles) {
-            const sessionPath = path.join(projectPath, sessionFile);
-            const sessionId = sessionFile.replace('.jsonl', '');
+                if (lines.length > 0) {
+                  const messages = lines.map(line => safeJsonParse(line)).filter(msg => msg !== null);
 
-            try {
-              const sessionContent = fs.readFileSync(sessionPath, 'utf-8');
-              const lines = sessionContent.trim().split('\n').filter(line => line.trim());
+                  // Find first user message
+                  const firstUserMessage = messages.find(msg => msg.type === 'user' && msg.message);
 
-              if (lines.length > 0) {
-                const messages = lines.map(line => {
-                  return safeJsonParse(line);
-                }).filter(msg => msg !== null);
+                  if (firstUserMessage) {
+                    const projectName = projectDir.replace(/-/g, '/').substring(1); // Remove leading dash and convert dashes to slashes
+                    const content = extractTextContent(firstUserMessage.message);
 
-                // Find first user message
-                const firstUserMessage = messages.find(msg => msg.type === 'user' && msg.message);
-
-                if (firstUserMessage) {
-                  const projectName = projectDir.replace(/-/g, '/').substring(1); // Remove leading dash and convert dashes to slashes
-
-                  const content = extractTextContent(firstUserMessage.message);
-
-                  sessionMap.set(sessionId, {
-                    id: sessionId,
-                    timestamp: new Date(firstUserMessage.timestamp).getTime(),
-                    display: content.substring(0, 100),
-                    project: projectName,
-                    projectDir: projectDir,
-                    messageCount: messages.filter(m => m.type === 'user' || m.type === 'assistant').length
-                  });
+                    sessionMap.set(sessionId, {
+                      source: 'claude',
+                      id: sessionId,
+                      timestamp: new Date(firstUserMessage.timestamp).getTime(),
+                      display: content.substring(0, 100),
+                      project: projectName,
+                      locator: projectDir,
+                      messageCount: messages.filter(m => m.type === 'user' || m.type === 'assistant').length
+                    });
+                  }
                 }
+              } catch (e) {
+                console.error('Error reading session file:', sessionPath, e);
               }
-            } catch (e) {
-              console.error('Error reading session file:', sessionPath, e);
             }
           }
         }
+      } else if (fs.existsSync(historyPath) && !fs.existsSync(projectsPath)) {
+        // Keep existing error messaging when Claude config exists but projects are missing.
+        console.warn('Claude config found but projects directory missing:', projectsPath);
+      } else if (!fs.existsSync(historyPath)) {
+        // Silently ignore: user may only want Codex sessions.
       }
+
+      sessions.push(...Array.from(sessionMap.values()));
+    } catch (e) {
+      console.error('Error reading Claude sessions:', e);
     }
 
-    // Convert to array and sort by timestamp (newest first)
-    const sessions = Array.from(sessionMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+    // Codex sessions (new)
+    try {
+      const codexPath = getCodexConfigPath();
+      const sessionsPath = path.join(codexPath, 'sessions');
+
+      const jsonlFiles = listFilesRecursive(sessionsPath, p => p.endsWith('.jsonl'));
+
+      for (const sessionFilePath of jsonlFiles) {
+        try {
+          const relPath = path.relative(sessionsPath, sessionFilePath);
+          if (!relPath || relPath.startsWith('..') || path.isAbsolute(relPath)) continue;
+
+          const content = fs.readFileSync(sessionFilePath, 'utf-8');
+          const lines = content.trim().split('\n').filter(Boolean);
+          if (lines.length === 0) continue;
+
+          const firstObj = safeJsonParse(lines[0]);
+          const sessionId =
+            (firstObj &&
+              typeof firstObj === 'object' &&
+              firstObj.type === 'session_meta' &&
+              firstObj.payload &&
+              typeof firstObj.payload.id === 'string' &&
+              firstObj.payload.id) ||
+            (firstObj && typeof firstObj.id === 'string' && firstObj.id) ||
+            path.basename(sessionFilePath).replace(/\.jsonl$/, '');
+
+          let ts = null;
+          const firstTs =
+            (firstObj &&
+              typeof firstObj === 'object' &&
+              firstObj.type === 'session_meta' &&
+              firstObj.payload &&
+              typeof firstObj.payload.timestamp === 'string' &&
+              firstObj.payload.timestamp) ||
+            (firstObj && typeof firstObj.timestamp === 'string' && firstObj.timestamp) ||
+            null;
+          if (firstTs) {
+            const t = new Date(firstTs).getTime();
+            if (!Number.isNaN(t)) ts = t;
+          }
+
+          let cwd = null;
+          let displayText = '';
+          let messageCount = 0;
+
+          for (const line of lines) {
+            const raw = safeJsonParse(line);
+            if (!raw || typeof raw !== 'object') continue;
+
+            // session_meta includes cwd directly in the newest format.
+            if (!cwd && raw.type === 'session_meta' && raw.payload && typeof raw.payload.cwd === 'string') {
+              cwd = raw.payload.cwd;
+            }
+
+            const { timestamp: wrapperTs, rec } = unwrapCodexRecord(raw);
+            if (!rec || typeof rec !== 'object') continue;
+
+            if (rec.type === 'message' && (rec.role === 'user' || rec.role === 'assistant')) {
+              messageCount += 1;
+            }
+
+            if (!cwd && rec.type === 'message' && rec.role === 'user' && rec.content) {
+              const text = extractCodexTextFromContentBlocks(rec.content);
+              const extracted = tryExtractCwdFromEnvText(text);
+              if (extracted) cwd = extracted;
+            }
+
+            if (!displayText && rec.type === 'message' && rec.role === 'user' && rec.content) {
+              const text = extractCodexTextFromContentBlocks(rec.content);
+              if (text && text.trim() && !isProbablyEnvironmentContextText(text)) {
+                displayText = text.trim();
+              }
+            }
+
+            if (!ts && rec.type === 'message' && rec.role === 'user' && rec.content) {
+              // Fallback timestamp: take the wrapper timestamp first (new format), then any explicit fields.
+              if (typeof wrapperTs === 'string') {
+                const t = new Date(wrapperTs).getTime();
+                if (!Number.isNaN(t)) ts = t;
+              } else if (typeof rec.created_at === 'string') {
+                const t = new Date(rec.created_at).getTime();
+                if (!Number.isNaN(t)) ts = t;
+              } else if (typeof rec.timestamp === 'string') {
+                const t = new Date(rec.timestamp).getTime();
+                if (!Number.isNaN(t)) ts = t;
+              }
+            }
+          }
+
+          if (!displayText) {
+            // Fallback to any first user message (including env context)
+            const firstUser = lines
+              .map(l => safeJsonParse(l))
+              .map(o => unwrapCodexRecord(o).rec)
+              .find(o => o && o.type === 'message' && o.role === 'user' && o.content);
+            if (firstUser) {
+              displayText = extractCodexTextFromContentBlocks(firstUser.content).trim();
+            }
+          }
+
+          const project =
+            cwd ||
+            (firstObj &&
+              typeof firstObj === 'object' &&
+              firstObj.type === 'session_meta' &&
+              firstObj.payload &&
+              firstObj.payload.git &&
+              (firstObj.payload.git.repository_url || firstObj.payload.git.branch)) ||
+            (firstObj && firstObj.git && (firstObj.git.repository_url || firstObj.git.branch)) ||
+            'Codex';
+          const timestamp = ts || 0;
+
+          sessions.push({
+            source: 'codex',
+            id: sessionId,
+            timestamp,
+            display: (displayText || '').substring(0, 100),
+            project: project,
+            locator: relPath,
+            messageCount
+          });
+        } catch (e) {
+          console.error('Error reading Codex session file:', sessionFilePath, e);
+        }
+      }
+    } catch (e) {
+      console.error('Error reading Codex sessions:', e);
+    }
+
+    // Sort by timestamp (newest first), stable fallback by id.
+    sessions.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0) || String(a.id).localeCompare(String(b.id)));
+
+    if (sessions.length === 0) {
+      const claudeHistory = path.join(getClaudeConfigPath(), 'history.jsonl');
+      const codexSessions = path.join(getCodexConfigPath(), 'sessions');
+      return { error: `No sessions found. Looked in ${claudeHistory} and ${codexSessions}` };
+    }
 
     return { sessions };
   } catch (error) {
@@ -149,11 +364,105 @@ ipcMain.handle('get-sessions', async () => {
   }
 });
 
-ipcMain.handle('get-session-details', async (event, sessionId, projectDir) => {
+ipcMain.handle('get-session-details', async (event, sessionId, locator, source) => {
   try {
+    if (source === 'codex') {
+      const codexPath = getCodexConfigPath();
+      const sessionsBase = path.join(codexPath, 'sessions');
+
+      if (typeof locator !== 'string' || !locator.trim()) {
+        return { error: 'Invalid Codex session locator' };
+      }
+
+      const resolvedBase = path.resolve(sessionsBase);
+      const resolvedPath = path.resolve(sessionsBase, locator);
+      if (!resolvedPath.startsWith(resolvedBase + path.sep)) {
+        return { error: 'Invalid Codex session path' };
+      }
+
+      if (!fs.existsSync(resolvedPath)) {
+        return { error: 'Session file not found' };
+      }
+
+      const sessionContent = fs.readFileSync(resolvedPath, 'utf-8');
+      const lines = sessionContent.trim().split('\n').filter(line => line.trim());
+
+      const records = lines.map(line => safeJsonParse(line)).filter(msg => msg !== null);
+      // Many Codex records don't include per-message timestamps; fall back to the session header timestamp.
+      let defaultTimestamp = null;
+      for (const rec of records) {
+        if (rec && typeof rec === 'object' && rec.timestamp) {
+          defaultTimestamp = rec.timestamp;
+          break;
+        }
+        if (
+          rec &&
+          typeof rec === 'object' &&
+          rec.type === 'session_meta' &&
+          rec.payload &&
+          typeof rec.payload.timestamp === 'string'
+        ) {
+          defaultTimestamp = rec.payload.timestamp;
+          break;
+        }
+      }
+
+      const formattedMessages = [];
+      let lastAssistantMsg = null;
+
+      for (const raw of records) {
+        if (!raw || typeof raw !== 'object') continue;
+        const { timestamp: wrapperTs, rec } = unwrapCodexRecord(raw);
+        if (!rec || typeof rec !== 'object') continue;
+
+        if (rec.type === 'message' && (rec.role === 'user' || rec.role === 'assistant')) {
+          const text = extractCodexTextFromContentBlocks(rec.content);
+
+          const msg = {
+            role: rec.role,
+            content: text,
+            timestamp: rec.timestamp || rec.created_at || wrapperTs || defaultTimestamp || null,
+            uuid: rec.id || null,
+            toolUses: [],
+            fileHistorySnapshots: []
+          };
+
+          formattedMessages.push(msg);
+          if (rec.role === 'assistant') lastAssistantMsg = msg;
+          continue;
+        }
+
+        if (rec.type === 'function_call' && typeof rec.name === 'string') {
+          if (!lastAssistantMsg) {
+            lastAssistantMsg = {
+              role: 'assistant',
+              content: '',
+              timestamp: rec.timestamp || rec.created_at || wrapperTs || defaultTimestamp || null,
+              uuid: rec.call_id || rec.id || null,
+              toolUses: [],
+              fileHistorySnapshots: []
+            };
+            formattedMessages.push(lastAssistantMsg);
+          }
+          lastAssistantMsg.toolUses.push({ name: rec.name });
+          continue;
+        }
+      }
+
+      const cleaned = formattedMessages.filter(msg => {
+        if (!msg) return false;
+        if (msg.content && String(msg.content).trim()) return true;
+        if (msg.toolUses && msg.toolUses.length > 0) return true;
+        return false;
+      });
+
+      return { messages: cleaned };
+    }
+
+    // Default: Claude
     const configPath = getClaudeConfigPath();
     const projectsPath = path.join(configPath, 'projects');
-    const sessionPath = path.join(projectsPath, projectDir, `${sessionId}.jsonl`);
+    const sessionPath = path.join(projectsPath, locator, `${sessionId}.jsonl`);
 
     if (!fs.existsSync(sessionPath)) {
       return { error: 'Session file not found' };
