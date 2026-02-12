@@ -14,6 +14,7 @@ const DEFAULT_EVENT_LOG_HEIGHT = 320;
 const PINNED_SESSIONS_STORAGE_KEY = 'hud:pinned-sessions';
 const FEED_FILTER_STORAGE_KEY = 'hud:feed-filter';
 const FEED_FILTER_VALUES = new Set(['all', 'user', 'assistant', 'tool', 'snapshot']);
+const BOOKMARKS_STORAGE_KEY = 'hud:event-bookmarks';
 let currentActiveSession = null;
 let currentRenderedMessages = [];
 let sessionFilterQuery = '';
@@ -21,6 +22,8 @@ let activeSourceFilter = 'all';
 let pinnedOnlyMode = false;
 let pinnedSessionKeys = new Set();
 let activeFeedFilter = 'all';
+let bookmarksBySession = {};
+let activeBookmarkIndices = new Set();
 let eventSearchMatches = [];
 let eventSearchCursor = -1;
 let statusResetTimeoutId = null;
@@ -160,6 +163,91 @@ function persistFeedFilterMode() {
   } catch (error) {
     // Ignore local storage persistence issues.
   }
+}
+
+function sanitizeBookmarkIndices(rawValue, maxIndex = Number.POSITIVE_INFINITY) {
+  if (!Array.isArray(rawValue)) return [];
+
+  const seen = new Set();
+  const normalized = [];
+
+  rawValue.forEach(value => {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > maxIndex || seen.has(parsed)) return;
+    seen.add(parsed);
+    normalized.push(parsed);
+  });
+
+  normalized.sort((a, b) => a - b);
+  return normalized;
+}
+
+function loadBookmarksBySession() {
+  try {
+    const raw = localStorage.getItem(BOOKMARKS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+
+    const normalized = {};
+    Object.entries(parsed).forEach(([sessionKey, indices]) => {
+      if (typeof sessionKey !== 'string' || !sessionKey.trim()) return;
+      normalized[sessionKey] = sanitizeBookmarkIndices(indices);
+    });
+
+    return normalized;
+  } catch (error) {
+    return {};
+  }
+}
+
+function persistBookmarksBySession() {
+  try {
+    localStorage.setItem(BOOKMARKS_STORAGE_KEY, JSON.stringify(bookmarksBySession));
+  } catch (error) {
+    // Ignore local storage persistence issues.
+  }
+}
+
+function getActiveSessionBookmarkKey() {
+  if (!currentSessionId) return null;
+  return `${currentSessionSource || 'claude'}:${currentSessionId}`;
+}
+
+function loadActiveSessionBookmarks() {
+  const key = getActiveSessionBookmarkKey();
+  if (!key) {
+    activeBookmarkIndices = new Set();
+    return;
+  }
+
+  const maxIndex = Math.max(0, currentRenderedMessages.length - 1);
+  const normalized = sanitizeBookmarkIndices(bookmarksBySession[key], maxIndex);
+  activeBookmarkIndices = new Set(normalized);
+  bookmarksBySession[key] = normalized;
+}
+
+function persistActiveSessionBookmarks() {
+  const key = getActiveSessionBookmarkKey();
+  if (!key) return;
+
+  const normalized = sanitizeBookmarkIndices([...activeBookmarkIndices], Math.max(0, currentRenderedMessages.length - 1));
+
+  if (normalized.length === 0) {
+    delete bookmarksBySession[key];
+  } else {
+    bookmarksBySession[key] = normalized;
+  }
+
+  persistBookmarksBySession();
+}
+
+function isIndexBookmarked(index) {
+  return Number.isInteger(index) && activeBookmarkIndices.has(index);
+}
+
+function getBookmarkedIndices() {
+  return sanitizeBookmarkIndices([...activeBookmarkIndices], Math.max(0, currentRenderedMessages.length - 1));
 }
 
 function updateSourceFilterControls() {
@@ -357,6 +445,10 @@ function updateVisibleEventMetric(visibleCount = 0) {
   setMetricValue('metricVisibleEventCount', visibleCount);
 }
 
+function updateBookmarkMetric(value = activeBookmarkIndices.size) {
+  setMetricValue('metricBookmarkCount', value);
+}
+
 function updateEventMapFilterState() {
   const eventMap = document.getElementById('eventMap');
   if (!eventMap) return;
@@ -369,6 +461,7 @@ function updateEventMapFilterState() {
     const message = Number.isInteger(index) ? currentRenderedMessages[index] : null;
     const visible = messageMatchesFeedFilter(message);
     marker.classList.toggle('is-filtered', !visible);
+    marker.classList.toggle('is-bookmarked', isIndexBookmarked(index));
   });
 }
 
@@ -377,12 +470,14 @@ function setActiveEventMapMarker(index) {
   activeEventMapIndex = safeIndex;
 
   const eventMap = document.getElementById('eventMap');
-  if (!eventMap) return;
+  if (eventMap) {
+    eventMap.querySelectorAll('.event-map-marker').forEach(marker => {
+      const markerIndex = Number.parseInt(marker.getAttribute('data-map-index') || '-1', 10);
+      marker.classList.toggle('is-active', markerIndex === safeIndex);
+    });
+  }
 
-  eventMap.querySelectorAll('.event-map-marker').forEach(marker => {
-    const markerIndex = Number.parseInt(marker.getAttribute('data-map-index') || '-1', 10);
-    marker.classList.toggle('is-active', markerIndex === safeIndex);
-  });
+  updateBookmarkListActiveState();
 }
 
 function updateActiveEventMapMarker() {
@@ -520,6 +615,144 @@ function scrollToMessageIndex(index, options = {}) {
   setActiveEventMapMarker(index);
 }
 
+function getMessagePreviewText(message) {
+  if (!message || typeof message !== 'object') return 'Event';
+  const compactContent = (message.content || '').replace(/\s+/g, ' ').trim();
+  if (compactContent) return truncateText(compactContent, 64);
+  if (messageHasTools(message) && messageHasSnapshots(message)) return 'Tool trace and snapshot activity';
+  if (messageHasTools(message)) return 'Tool trace activity';
+  if (messageHasSnapshots(message)) return 'Snapshot activity';
+  return 'System event';
+}
+
+function renderBookmarkList() {
+  const list = document.getElementById('bookmarkList');
+  if (!list) return;
+
+  const indices = getBookmarkedIndices();
+  if (indices.length === 0) {
+    list.innerHTML = '<div class="bookmark-empty">NO PINNED EVENTS</div>';
+    updateBookmarkMetric(0);
+    return;
+  }
+
+  const rows = indices.map(index => {
+    const message = currentRenderedMessages[index];
+    if (!message) return '';
+
+    const role = message.role === 'user'
+      ? 'USR'
+      : (currentSessionSource === 'codex' ? 'CDX' : 'AST');
+    const preview = getMessagePreviewText(message);
+    const timeLabel = message.timestamp ? formatMessageTimestamp(message.timestamp) : 'N/A';
+
+    return `
+      <div class="bookmark-row">
+        <button
+          type="button"
+          class="bookmark-item"
+          data-bookmark-index="${index}"
+          aria-label="Jump to pinned event ${index + 1}"
+        >
+          <span class="bookmark-item-top">
+            <span class="bookmark-item-index">#${index + 1}</span>
+            <span class="bookmark-item-role">${escapeHtml(role)}</span>
+            <span class="bookmark-item-time">${escapeHtml(timeLabel)}</span>
+          </span>
+          <span class="bookmark-item-text">${escapeHtml(preview)}</span>
+        </button>
+        <button
+          type="button"
+          class="bookmark-drop"
+          data-bookmark-drop="${index}"
+          aria-label="Remove pinned event ${index + 1}"
+        >×</button>
+      </div>
+    `;
+  }).join('');
+
+  list.innerHTML = rows;
+  updateBookmarkMetric(indices.length);
+  updateBookmarkListActiveState();
+
+  list.querySelectorAll('.bookmark-item[data-bookmark-index]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const index = Number.parseInt(btn.getAttribute('data-bookmark-index') || '-1', 10);
+      if (!Number.isInteger(index) || index < 0) return;
+      scrollToMessageIndex(index);
+    });
+  });
+
+  list.querySelectorAll('.bookmark-drop[data-bookmark-drop]').forEach(btn => {
+    btn.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const index = Number.parseInt(btn.getAttribute('data-bookmark-drop') || '-1', 10);
+      if (!Number.isInteger(index) || index < 0) return;
+      toggleBookmarkForIndex(index, { announce: true });
+    });
+  });
+}
+
+function updateBookmarkListActiveState() {
+  const list = document.getElementById('bookmarkList');
+  if (!list) return;
+
+  list.querySelectorAll('.bookmark-item[data-bookmark-index]').forEach(btn => {
+    const index = Number.parseInt(btn.getAttribute('data-bookmark-index') || '-1', 10);
+    btn.classList.toggle('is-active', index === activeEventMapIndex);
+  });
+}
+
+function applyBookmarkStyles(index) {
+  const messageEl = document.querySelector(`#chatContainer .message[data-message-index="${index}"]`);
+  if (messageEl) {
+    messageEl.classList.toggle('is-bookmarked', isIndexBookmarked(index));
+  }
+
+  const bookmarkBtn = document.querySelector(`#chatContainer .message-bookmark-btn[data-bookmark-index="${index}"]`);
+  if (bookmarkBtn) {
+    const active = isIndexBookmarked(index);
+    bookmarkBtn.classList.toggle('active', active);
+    bookmarkBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    bookmarkBtn.setAttribute('aria-label', active ? 'Unpin event' : 'Pin event');
+  }
+}
+
+function toggleBookmarkForIndex(index, options = {}) {
+  const { announce = false } = options;
+  if (!Number.isInteger(index) || index < 0 || index >= currentRenderedMessages.length) return;
+
+  const added = !activeBookmarkIndices.has(index);
+  if (added) {
+    activeBookmarkIndices.add(index);
+  } else {
+    activeBookmarkIndices.delete(index);
+  }
+
+  persistActiveSessionBookmarks();
+  applyBookmarkStyles(index);
+  renderBookmarkList();
+  renderEventMap(currentRenderedMessages);
+
+  if (announce) {
+    setTransientStatus(added ? `PINNED EVT #${index + 1}` : `UNPIN EVT #${index + 1}`, 'live', 900);
+  }
+}
+
+function attachMessageBookmarkHandlers(container) {
+  container.querySelectorAll('.message-bookmark-btn[data-bookmark-index]').forEach(btn => {
+    btn.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const index = Number.parseInt(btn.getAttribute('data-bookmark-index') || '-1', 10);
+      if (!Number.isInteger(index) || index < 0) return;
+      toggleBookmarkForIndex(index, { announce: true });
+    });
+  });
+}
+
 function getVisibleMessageIndices() {
   const indices = [];
   for (let i = 0; i < currentRenderedMessages.length; i += 1) {
@@ -539,6 +772,17 @@ function jumpToAdjacentVisibleMessage(direction) {
   const seedPos = currentPos === -1 ? (step > 0 ? -1 : 0) : currentPos;
   const nextPos = (seedPos + step + visibleIndices.length) % visibleIndices.length;
   scrollToMessageIndex(visibleIndices[nextPos]);
+}
+
+function jumpToAdjacentBookmark(direction) {
+  const step = direction >= 0 ? 1 : -1;
+  const bookmarkIndices = getBookmarkedIndices();
+  if (bookmarkIndices.length === 0) return;
+
+  const currentPos = bookmarkIndices.indexOf(activeEventMapIndex);
+  const seedPos = currentPos === -1 ? (step > 0 ? -1 : 0) : currentPos;
+  const nextPos = (seedPos + step + bookmarkIndices.length) % bookmarkIndices.length;
+  scrollToMessageIndex(bookmarkIndices[nextPos]);
 }
 
 function getEventMapMarkerType(message) {
@@ -563,6 +807,7 @@ function renderEventMap(messages = []) {
     const top = messages.length === 1 ? 50 : (index / denominator) * 100;
     const type = getEventMapMarkerType(message);
     const flags = [
+      isIndexBookmarked(index) ? 'is-bookmarked' : '',
       messageHasTools(message) ? 'has-tool' : '',
       messageHasSnapshots(message) ? 'has-snapshot' : ''
     ].filter(Boolean).join(' ');
@@ -753,17 +998,20 @@ function buildSessionFilename(extension) {
 function buildConversationMarkdown(session, messages) {
   const lines = [];
   const title = session && session.display ? session.display : 'Conversation Export';
+  const bookmarked = new Set(getBookmarkedIndices());
   lines.push(`# ${title}`);
   lines.push('');
   lines.push(`- Source: ${(session && session.source) || currentSessionSource || 'unknown'}`);
   lines.push(`- Session ID: ${(session && session.id) || currentSessionId || 'unknown'}`);
   lines.push(`- Project: ${(session && session.project) || 'unknown/project'}`);
   lines.push(`- Exported: ${new Date().toISOString()}`);
+  lines.push(`- Bookmarks: ${bookmarked.size}`);
   lines.push('');
 
   messages.forEach((msg, index) => {
     lines.push(`## ${index + 1}. ${msg.role === 'user' ? 'User' : (currentSessionSource === 'codex' ? 'Codex' : 'Claude')}`);
     lines.push(`Timestamp: ${msg.timestamp ? formatMessageTimestamp(msg.timestamp) : 'N/A'}`);
+    if (bookmarked.has(index)) lines.push('Pinned: yes');
     lines.push('');
 
     if (msg.content && msg.content.trim()) {
@@ -797,6 +1045,7 @@ function buildConversationMarkdown(session, messages) {
 }
 
 function buildConversationJson(session, messages) {
+  const bookmarked = new Set(getBookmarkedIndices());
   return JSON.stringify({
     exportedAt: new Date().toISOString(),
     session: {
@@ -806,7 +1055,11 @@ function buildConversationJson(session, messages) {
       title: (session && session.display) || null,
       timestamp: (session && session.timestamp) || null
     },
-    messages
+    bookmarks: [...bookmarked],
+    messages: messages.map((message, index) => ({
+      ...message,
+      bookmarked: bookmarked.has(index)
+    }))
   }, null, 2);
 }
 
@@ -921,14 +1174,36 @@ function initializeKeyboardShortcuts() {
       }
     }
 
-    if (!isTypingInField && event.key === '[') {
+    if (!isTypingInField && !event.altKey && !event.metaKey && !event.ctrlKey && event.key === '[') {
       event.preventDefault();
       jumpToAdjacentVisibleMessage(-1);
     }
 
-    if (!isTypingInField && event.key === ']') {
+    if (!isTypingInField && !event.altKey && !event.metaKey && !event.ctrlKey && event.key === ']') {
       event.preventDefault();
       jumpToAdjacentVisibleMessage(1);
+    }
+
+    if (!isTypingInField && event.altKey && !event.metaKey && !event.ctrlKey && event.key === '[') {
+      event.preventDefault();
+      jumpToAdjacentBookmark(-1);
+    }
+
+    if (!isTypingInField && event.altKey && !event.metaKey && !event.ctrlKey && event.key === ']') {
+      event.preventDefault();
+      jumpToAdjacentBookmark(1);
+    }
+
+    if (!isTypingInField && event.key.toLowerCase() === 'b') {
+      event.preventDefault();
+      const fallbackIndex = getVisibleMessageIndices()[0];
+      const targetIndex = Number.isInteger(activeEventMapIndex) && activeEventMapIndex >= 0
+        ? activeEventMapIndex
+        : fallbackIndex;
+
+      if (Number.isInteger(targetIndex) && targetIndex >= 0) {
+        toggleBookmarkForIndex(targetIndex, { announce: true });
+      }
     }
   });
 }
@@ -1527,7 +1802,10 @@ async function loadSessions() {
       sessionCount.textContent = 'ERROR';
       setMetricValue('metricSessionCount', 0);
       setMetricValue('metricVisibleEventCount', 0);
+      updateBookmarkMetric(0);
+      activeBookmarkIndices = new Set();
       renderEventMap([]);
+      renderBookmarkList();
       return;
     }
 
@@ -1542,8 +1820,11 @@ async function loadSessions() {
       updateHeaderSession(null, 0);
       setMetricValue('metricEventCount', 0);
       setMetricValue('metricVisibleEventCount', 0);
+      updateBookmarkMetric(0);
+      activeBookmarkIndices = new Set();
       renderGraphCanvas([]);
       renderEventMap([]);
+      renderBookmarkList();
       setEventLogStatus('STANDBY');
       updateHeaderActionState();
       return;
@@ -1555,7 +1836,10 @@ async function loadSessions() {
     sessionCount.textContent = 'ERROR';
     setMetricValue('metricSessionCount', 0);
     setMetricValue('metricVisibleEventCount', 0);
+    updateBookmarkMetric(0);
+    activeBookmarkIndices = new Set();
     renderEventMap([]);
+    renderBookmarkList();
   } finally {
     isLoadingSessions = false;
   }
@@ -1584,6 +1868,10 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 
     if (result.error) {
       chatContainer.innerHTML = `<div class="error-message">${result.error}</div>`;
+      activeBookmarkIndices = new Set();
+      updateBookmarkMetric(0);
+      renderBookmarkList();
+      renderEventMap([]);
       setEventLogStatus('FAULT', 'alert');
       return;
     }
@@ -1599,12 +1887,14 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
       project: ''
     };
     currentRenderedMessages = result.messages || [];
+    loadActiveSessionBookmarks();
 
     updateHeaderSession(currentActiveSession, currentRenderedMessages.length);
 
     chatContainer.innerHTML = currentRenderedMessages.map((msg, index) => {
       const hasTools = messageHasTools(msg);
       const hasSnapshots = messageHasSnapshots(msg);
+      const isBookmarked = isIndexBookmarked(index);
       let contentHtml = '';
       if (msg.content) {
         contentHtml = marked.parse(msg.content);
@@ -1621,7 +1911,7 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 
       return `
         <div
-          class="message ${msg.role}"
+          class="message ${msg.role}${isBookmarked ? ' is-bookmarked' : ''}"
           data-message-index="${index}"
           data-role="${escapeHtml(msg.role || 'assistant')}"
           data-has-tool="${hasTools ? '1' : '0'}"
@@ -1630,6 +1920,13 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
           <div class="message-header">
             <div class="message-role ${msg.role}">${msg.role === 'user' ? 'USER' : assistantName}</div>
             <div class="message-timestamp">${formatMessageTimestamp(msg.timestamp)}</div>
+            <button
+              type="button"
+              class="message-bookmark-btn ${isBookmarked ? 'active' : ''}"
+              data-bookmark-index="${index}"
+              aria-pressed="${isBookmarked ? 'true' : 'false'}"
+              aria-label="${isBookmarked ? 'Unpin event' : 'Pin event'}"
+            >◆</button>
           </div>
           ${contentSection}
           ${toolUsesHtml}
@@ -1640,6 +1937,8 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 
     attachFileHistoryHandlers(chatContainer);
     attachToolTraceHandlers(chatContainer);
+    attachMessageBookmarkHandlers(chatContainer);
+    renderBookmarkList();
     renderEventMap(currentRenderedMessages);
     renderGraphCanvas(currentRenderedMessages);
     const visibleCount = applyFeedFilter({ runSearch: true, preserveSearchIndex: true });
@@ -1658,6 +1957,10 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
     setEventLogStatus('LIVE', 'live');
   } catch (error) {
     chatContainer.innerHTML = `<div class="error-message">Error loading conversation: ${error.message}</div>`;
+    activeBookmarkIndices = new Set();
+    updateBookmarkMetric(0);
+    renderBookmarkList();
+    renderEventMap([]);
     setEventLogStatus('FAULT', 'alert');
   } finally {
     isLoadingSessionDetails = false;
@@ -1667,6 +1970,7 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 window.addEventListener('DOMContentLoaded', () => {
   pinnedSessionKeys = loadPinnedSessionKeys();
   activeFeedFilter = loadFeedFilterMode();
+  bookmarksBySession = loadBookmarksBySession();
   initializeSidebarControls();
   initializeFeedFilterControls();
   initializeEventSearchControls();
@@ -1680,6 +1984,8 @@ window.addEventListener('DOMContentLoaded', () => {
   setMetricValue('metricSessionCount', 0);
   setMetricValue('metricEventCount', 0);
   setMetricValue('metricVisibleEventCount', 0);
+  setMetricValue('metricBookmarkCount', 0);
+  renderBookmarkList();
   setEventLogStatus('STANDBY');
 
   loadSessions();

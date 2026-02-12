@@ -90,6 +90,7 @@
             <div class="metric-row"><span>SESSIONS</span><strong id="metricSessionCount">0</strong></div>
             <div class="metric-row"><span>EVENTS</span><strong id="metricEventCount">0</strong></div>
             <div class="metric-row"><span>VISIBLE</span><strong id="metricVisibleEventCount">0</strong></div>
+            <div class="metric-row"><span>BOOKMARKS</span><strong id="metricBookmarkCount">0</strong></div>
           </section>
 
           <section class="dock-panel entity-panel">
@@ -108,6 +109,14 @@
           <section class="dock-panel event-map-panel">
             <div class="dock-title">EVENT MAP LANE</div>
             <div class="event-map" id="eventMap" aria-label="Event map lane"></div>
+          </section>
+
+          <section class="dock-panel bookmark-panel">
+            <div class="dock-title">PINNED EVENTS</div>
+            <div class="bookmark-list" id="bookmarkList" aria-label="Pinned event list">
+              <div class="bookmark-empty">NO PINNED EVENTS</div>
+            </div>
+            <div class="bookmark-hint">B TOGGLE • ALT+[ / ALT+] NAV</div>
           </section>
         </aside>
       </div>
