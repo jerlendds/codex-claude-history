@@ -73,6 +73,104 @@ function isProbablyEnvironmentContextText(text) {
   return t.startsWith('<environment_context>') || t.includes('<environment_context>');
 }
 
+function truncateForUi(text, max = 12000) {
+  if (typeof text !== 'string') return '';
+  if (text.length <= max) return text;
+  const remaining = text.length - max;
+  return `${text.slice(0, max)}\n… [truncated ${remaining} chars]`;
+}
+
+function parseStructuredPayload(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = safeJsonParse(trimmed);
+    if (parsed && typeof parsed === 'object') return parsed;
+  }
+  return null;
+}
+
+function findCommandLikeString(value, depth = 0) {
+  if (depth > 4 || value == null) return null;
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed || null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const found = findCommandLikeString(entry, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof value !== 'object') return null;
+
+  const preferredKeys = [
+    'cmd',
+    'command',
+    'shell_command',
+    'commandLine',
+    'script',
+    'patch',
+    'query'
+  ];
+
+  for (const key of preferredKeys) {
+    if (typeof value[key] === 'string' && value[key].trim()) {
+      return value[key].trim();
+    }
+  }
+
+  for (const key of Object.keys(value)) {
+    const found = findCommandLikeString(value[key], depth + 1);
+    if (found) return found;
+  }
+
+  return null;
+}
+
+function stringifyPayloadForUi(payload) {
+  if (payload == null) return '';
+  if (typeof payload === 'string') return truncateForUi(payload);
+  try {
+    return truncateForUi(JSON.stringify(payload, null, 2));
+  } catch (e) {
+    return truncateForUi(String(payload));
+  }
+}
+
+function normalizeToolUse(name, payloadSource, fallbackText = '', callId = null) {
+  const payload = parseStructuredPayload(payloadSource);
+  const rawPayloadText = typeof payloadSource === 'string' ? payloadSource.trim() : '';
+  const rawFallback = typeof fallbackText === 'string' ? fallbackText.trim() : '';
+
+  const command =
+    findCommandLikeString(payload) ||
+    (rawPayloadText && !parseStructuredPayload(rawPayloadText) ? rawPayloadText : '') ||
+    rawFallback;
+
+  let payloadText = '';
+  if (payload) {
+    payloadText = stringifyPayloadForUi(payload);
+  } else if (rawPayloadText && rawPayloadText !== command) {
+    payloadText = truncateForUi(rawPayloadText);
+  } else if (rawFallback && rawFallback !== command) {
+    payloadText = truncateForUi(rawFallback);
+  }
+
+  return {
+    name: name || 'tool',
+    command: truncateForUi(command || '', 4000),
+    payload: payloadText,
+    callId: callId || null
+  };
+}
+
 function unwrapCodexRecord(obj) {
   // Codex has at least two observed on-disk formats:
   // 1) Old: { type: "message" | "function_call" | ... }
@@ -444,7 +542,21 @@ ipcMain.handle('get-session-details', async (event, sessionId, locator, source) 
             };
             formattedMessages.push(lastAssistantMsg);
           }
-          lastAssistantMsg.toolUses.push({ name: rec.name });
+          const payloadSource =
+            rec.arguments ??
+            rec.input ??
+            rec.parameters ??
+            rec.args ??
+            rec.kwargs ??
+            null;
+          const fallbackText =
+            rec.command ??
+            (typeof rec.arguments === 'string' ? rec.arguments : '') ??
+            '';
+
+          lastAssistantMsg.toolUses.push(
+            normalizeToolUse(rec.name, payloadSource, fallbackText, rec.call_id || rec.id || null)
+          );
           continue;
         }
       }
@@ -456,7 +568,8 @@ ipcMain.handle('get-session-details', async (event, sessionId, locator, source) 
         return false;
       });
 
-      return { messages: cleaned };
+      // Hide the first two Codex chat entries (typically bootstrap/system chatter).
+      return { messages: cleaned.slice(2) };
     }
 
     // Default: Claude
@@ -511,7 +624,17 @@ ipcMain.handle('get-session-details', async (event, sessionId, locator, source) 
             content: content,
             timestamp: msg.timestamp,
             uuid: msg.uuid,
-            toolUses: msg.message.content?.filter(block => block.type === 'tool_use') || [],
+            toolUses:
+              msg.message.content
+                ?.filter(block => block.type === 'tool_use')
+                .map(block =>
+                  normalizeToolUse(
+                    block.name,
+                    block.input ?? block.arguments ?? block.parameters ?? null,
+                    typeof block.input === 'string' ? block.input : '',
+                    block.id || null
+                  )
+                ) || [],
             fileHistorySnapshots: fileHistorySnapshotsByMessageId.get(msg.uuid) || []
           };
         }

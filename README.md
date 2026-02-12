@@ -1,8 +1,6 @@
-# Claude Code History Viewer
+# Claude + Codex History Viewer
 
-> Browse and search your Claude Code session history in a beautiful chat interface
-
-An Electron desktop app that displays your Claude Code session history in a clean, chat-style interface similar to the Claude desktop app. Never lose track of your AI conversations again!
+> Browse and search your Claude or Codex session history in a chat interface
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -10,34 +8,19 @@ An Electron desktop app that displays your Claude Code session history in a clea
 
 ## ✨ Features
 
-- **📚 Session Browser**: Browse all your Claude Code sessions in a sidebar, sorted by date (newest first)
-- **💬 Full Conversations**: View complete conversation history with proper formatting
-- **🎨 Syntax Highlighting**: Code blocks are automatically highlighted with language detection
-- **🔧 Tool Usage Display**: See which tools Claude used during each conversation
-- **📁 File History Snapshots**: Expand messages to view `.claude/file-history` snapshots captured during the session
-- **🌙 Dark Theme**: Modern, dark-themed interface inspired by the Claude desktop app
-- **⚡ Fast & Lightweight**: No heavy frameworks, just vanilla JavaScript
-- **🔒 Privacy First**: All data stays local on your machine
+- **Session Browser**: Browse all your Claude Code sessions in a sidebar, sorted by date (newest first)
+- **Full Conversations**: View complete conversation history with proper formatting
+- **Syntax Highlighting**: Code blocks are automatically highlighted with language detection
+- **Tool Usage Display**: See which tools Claude used during each conversation
+- **File History Snapshots**: Expand messages to view `.claude/file-history` snapshots captured during the session
+- **Dark Theme**: Modern, dark-themed interface inspired by the Claude desktop app
+- **Fast & Lightweight**: No heavy frameworks, just vanilla JavaScript
+- **Privacy First**: All data stays local on your machine
 
-## 📦 Installation
-
-### Option 1: Pre-built App (macOS)
-
-Download and install the `.dmg` file from the [releases page](../../releases), or build it yourself:
+### Run from Source
 
 ```bash
-git clone https://github.com/yanicklandry/claude-code-history-viewer.git
-cd claude-code-history-viewer
-npm install
-npm run build:mac
-```
-
-The app will be available at `dist/mac-arm64/Claude Code History.app`. Drag it to your Applications folder and add to Dock!
-
-### Option 2: Run from Source
-
-```bash
-git clone https://github.com/yanicklandry/claude-code-history-viewer.git
+git clone https://github.com/jerlendds/claude-code-history-viewer.git
 cd claude-code-history-viewer
 npm install
 npm start
@@ -119,4 +102,4 @@ Built with ❤️ for the Claude Code community. Special thanks to Anthropic for
 
 ---
 
-**Note**: This is an unofficial third-party tool and is not affiliated with or endorsed by Anthropic.
+**Note**: This is an unofficial third-party tool and is not affiliated with or endorsed by Anthropic or OpenAI.
