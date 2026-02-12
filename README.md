@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 
-## ✨ Features
+## Features
 
 - **Session Browser**: Browse all your Claude Code sessions in a sidebar, sorted by date (newest first)
 - **Full Conversations**: View complete conversation history with proper formatting
@@ -26,15 +26,16 @@ npm install
 npm start
 ```
 
-## 🚀 Usage
+## Usage
 
 Simply launch the app! It will automatically find your Claude Code history in the standard location:
+
 - **macOS/Linux**: `~/.claude/`
 - **Windows**: `%APPDATA%\claude\`
 
 Click any session in the sidebar to view the full conversation.
 
-## 🛠️ How It Works
+## How It Works
 
 The app reads session data directly from your local Claude Code storage:
 
@@ -48,20 +49,21 @@ The app reads session data directly from your local Claude Code storage:
    - File history snapshot metadata (and on-demand snapshot file contents)
 
 Sessions are displayed with:
+
 - Smart timestamp formatting ("Today", "Yesterday", or full date)
 - Initial prompt preview in the sidebar
 - Full conversation with proper markdown rendering
 - Syntax-highlighted code blocks
 - Tool usage indicators
 
-## 🏗️ Tech Stack
+## Tech Stack
 
 - **Electron** - Cross-platform desktop framework
 - **Marked** - Markdown parsing and rendering
 - **Highlight.js** - Syntax highlighting with GitHub Dark theme
 - **Vanilla JavaScript** - No heavy frameworks, fast and lightweight
 
-## 📂 Project Structure
+## Project Structure
 
 ```
 claude-code-history-viewer/
@@ -82,23 +84,23 @@ npm run build:win   # Build for Windows (NSIS installer)
 npm run build:linux # Build for Linux (AppImage + deb)
 ```
 
-## 📋 Requirements
+## Requirements
 
 - Node.js 16 or higher
 - An existing Claude Code installation with session history
 - macOS 10.12+ (for macOS builds)
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Feel free to open issues or submit pull requests.
 
-## 📝 License
+## License
 
-MIT License - feel free to use this project however you'd like!
+MIT License
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-Built with ❤️ for the Claude Code community. Special thanks to Anthropic for creating Claude Code!
+Built with ❤️. Based on [yanicklandry/claude-code-history-viewer](https://github.com/yanicklandry/claude-code-history-viewer)
 
 ---
 
