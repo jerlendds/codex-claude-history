@@ -6,6 +6,8 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 
+[demo video](https://github.com/user-attachments/assets/39770826-35f6-46cf-a371-d213fe7f92e3)
+
 ## Features
 
 - **Session Browser**: Browse all your Claude Code sessions in a sidebar, sorted by date (newest first)
