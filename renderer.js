@@ -12,15 +12,19 @@ let isLoadingSessionDetails = false;
 const EVENT_LOG_HEIGHT_STORAGE_KEY = 'hud:event-log-height';
 const DEFAULT_EVENT_LOG_HEIGHT = 320;
 const PINNED_SESSIONS_STORAGE_KEY = 'hud:pinned-sessions';
+const FEED_FILTER_STORAGE_KEY = 'hud:feed-filter';
+const FEED_FILTER_VALUES = new Set(['all', 'user', 'assistant', 'tool', 'snapshot']);
 let currentActiveSession = null;
 let currentRenderedMessages = [];
 let sessionFilterQuery = '';
 let activeSourceFilter = 'all';
 let pinnedOnlyMode = false;
 let pinnedSessionKeys = new Set();
+let activeFeedFilter = 'all';
 let eventSearchMatches = [];
 let eventSearchCursor = -1;
 let statusResetTimeoutId = null;
+let activeEventMapIndex = -1;
 
 const BASE_GRAPH_NODES = [
   { id: 'session', label: 'Session File Root', glyph: 'SES', x: 148, y: 110 },
@@ -135,6 +139,24 @@ function loadPinnedSessionKeys() {
 function persistPinnedSessionKeys() {
   try {
     localStorage.setItem(PINNED_SESSIONS_STORAGE_KEY, JSON.stringify([...pinnedSessionKeys]));
+  } catch (error) {
+    // Ignore local storage persistence issues.
+  }
+}
+
+function loadFeedFilterMode() {
+  try {
+    const raw = localStorage.getItem(FEED_FILTER_STORAGE_KEY);
+    if (!raw || !FEED_FILTER_VALUES.has(raw)) return 'all';
+    return raw;
+  } catch (error) {
+    return 'all';
+  }
+}
+
+function persistFeedFilterMode() {
+  try {
+    localStorage.setItem(FEED_FILTER_STORAGE_KEY, activeFeedFilter);
   } catch (error) {
     // Ignore local storage persistence issues.
   }
@@ -299,6 +321,300 @@ function renderSessionList() {
   }
 }
 
+function getFeedFilterLabel(filter) {
+  if (filter === 'user') return 'USR';
+  if (filter === 'assistant') return 'AST';
+  if (filter === 'tool') return 'TOOL';
+  if (filter === 'snapshot') return 'SNAP';
+  return 'ALL';
+}
+
+function messageHasTools(message) {
+  return !!(message && Array.isArray(message.toolUses) && message.toolUses.length > 0);
+}
+
+function messageHasSnapshots(message) {
+  return !!(message && Array.isArray(message.fileHistorySnapshots) && message.fileHistorySnapshots.length > 0);
+}
+
+function messageMatchesFeedFilter(message, filter = activeFeedFilter) {
+  if (!message) return false;
+  if (filter === 'user') return message.role === 'user';
+  if (filter === 'assistant') return message.role === 'assistant';
+  if (filter === 'tool') return messageHasTools(message);
+  if (filter === 'snapshot') return messageHasSnapshots(message);
+  return true;
+}
+
+function updateFeedFilterControls() {
+  document.querySelectorAll('.feed-filter-btn[data-feed-filter]').forEach(btn => {
+    const filter = btn.getAttribute('data-feed-filter');
+    btn.classList.toggle('active', filter === activeFeedFilter);
+  });
+}
+
+function updateVisibleEventMetric(visibleCount = 0) {
+  setMetricValue('metricVisibleEventCount', visibleCount);
+}
+
+function updateEventMapFilterState() {
+  const eventMap = document.getElementById('eventMap');
+  if (!eventMap) return;
+
+  const filterLabel = document.getElementById('eventMapFilterLabel');
+  if (filterLabel) filterLabel.textContent = getFeedFilterLabel(activeFeedFilter);
+
+  eventMap.querySelectorAll('.event-map-marker').forEach(marker => {
+    const index = Number.parseInt(marker.getAttribute('data-map-index') || '-1', 10);
+    const message = Number.isInteger(index) ? currentRenderedMessages[index] : null;
+    const visible = messageMatchesFeedFilter(message);
+    marker.classList.toggle('is-filtered', !visible);
+  });
+}
+
+function setActiveEventMapMarker(index) {
+  const safeIndex = Number.isInteger(index) ? index : -1;
+  activeEventMapIndex = safeIndex;
+
+  const eventMap = document.getElementById('eventMap');
+  if (!eventMap) return;
+
+  eventMap.querySelectorAll('.event-map-marker').forEach(marker => {
+    const markerIndex = Number.parseInt(marker.getAttribute('data-map-index') || '-1', 10);
+    marker.classList.toggle('is-active', markerIndex === safeIndex);
+  });
+}
+
+function updateActiveEventMapMarker() {
+  const chatContainer = document.getElementById('chatContainer');
+  if (!chatContainer) {
+    setActiveEventMapMarker(-1);
+    return;
+  }
+
+  const visibleMessages = [...chatContainer.querySelectorAll('.message:not(.feed-hidden)')];
+  if (visibleMessages.length === 0) {
+    setActiveEventMapMarker(-1);
+    return;
+  }
+
+  const targetY = chatContainer.scrollTop + (chatContainer.clientHeight * 0.3);
+  let bestMessage = visibleMessages[0];
+  let smallestDelta = Math.abs(bestMessage.offsetTop - targetY);
+
+  for (const messageEl of visibleMessages) {
+    const delta = Math.abs(messageEl.offsetTop - targetY);
+    if (delta < smallestDelta) {
+      bestMessage = messageEl;
+      smallestDelta = delta;
+    }
+  }
+
+  const index = Number.parseInt(bestMessage.getAttribute('data-message-index') || '-1', 10);
+  setActiveEventMapMarker(index);
+}
+
+function applyFeedFilter(options = {}) {
+  const { runSearch = true, preserveSearchIndex = true } = options;
+  const messageEls = [...document.querySelectorAll('#chatContainer .message')];
+  let visibleCount = 0;
+
+  messageEls.forEach(el => {
+    const index = Number.parseInt(el.getAttribute('data-message-index') || '-1', 10);
+    const message = Number.isInteger(index) ? currentRenderedMessages[index] : null;
+    const visible = messageMatchesFeedFilter(message);
+
+    el.classList.toggle('feed-hidden', !visible);
+    if (visible) visibleCount += 1;
+  });
+
+  updateVisibleEventMetric(visibleCount);
+  updateEventMapFilterState();
+
+  if (runSearch) {
+    runEventSearch({ preserveIndex: preserveSearchIndex, scroll: false });
+  }
+
+  updateActiveEventMapMarker();
+  return visibleCount;
+}
+
+function setFeedFilter(filter, options = {}) {
+  const {
+    persist = true,
+    announce = false,
+    preserveSearchIndex = true
+  } = options;
+
+  const nextFilter = FEED_FILTER_VALUES.has(filter) ? filter : 'all';
+  const changed = nextFilter !== activeFeedFilter;
+  activeFeedFilter = nextFilter;
+
+  updateFeedFilterControls();
+  if (persist) persistFeedFilterMode();
+
+  if (currentRenderedMessages.length > 0) {
+    applyFeedFilter({ runSearch: true, preserveSearchIndex });
+    renderGraphCanvas(currentRenderedMessages);
+  } else {
+    updateVisibleEventMetric(0);
+    renderGraphCanvas([]);
+  }
+
+  if (changed && announce) {
+    setTransientStatus(`FILTER ${getFeedFilterLabel(activeFeedFilter)}`, 'live', 850);
+  }
+}
+
+function initializeFeedFilterControls() {
+  document.querySelectorAll('.feed-filter-btn[data-feed-filter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const filter = btn.getAttribute('data-feed-filter');
+      if (!filter) return;
+      setFeedFilter(filter, { announce: true });
+    });
+  });
+
+  updateFeedFilterControls();
+}
+
+function getGraphNodeFeedFilter(nodeId) {
+  if (!nodeId || typeof nodeId !== 'string') return 'all';
+  if (nodeId === 'prompt') return 'user';
+  if (nodeId === 'response') return 'assistant';
+  if (nodeId === 'tool' || nodeId.startsWith('tool-ext-')) return 'tool';
+  if (nodeId === 'snapshot') return 'snapshot';
+  return 'all';
+}
+
+function isGraphNodeSelected(nodeId) {
+  if (activeFeedFilter === 'all') return nodeId === 'session';
+  if (activeFeedFilter === 'user') return nodeId === 'prompt';
+  if (activeFeedFilter === 'assistant') return nodeId === 'response';
+  if (activeFeedFilter === 'snapshot') return nodeId === 'snapshot';
+  if (activeFeedFilter === 'tool') return nodeId === 'tool' || nodeId.startsWith('tool-ext-');
+  return false;
+}
+
+function scrollToMessageIndex(index, options = {}) {
+  const { behavior = 'smooth', block = 'center' } = options;
+  const chatContainer = document.getElementById('chatContainer');
+  if (!chatContainer || !Number.isInteger(index) || index < 0) return;
+
+  let messageEl = chatContainer.querySelector(`.message[data-message-index="${index}"]`);
+  if (!messageEl) return;
+
+  if (messageEl.classList.contains('feed-hidden')) {
+    setFeedFilter('all', { announce: true });
+    messageEl = chatContainer.querySelector(`.message[data-message-index="${index}"]`);
+    if (!messageEl) return;
+  }
+
+  messageEl.scrollIntoView({ behavior, block });
+  document.querySelectorAll('#chatContainer .message.map-focus').forEach(el => el.classList.remove('map-focus'));
+  messageEl.classList.add('map-focus');
+  setTimeout(() => {
+    messageEl.classList.remove('map-focus');
+  }, 900);
+
+  setActiveEventMapMarker(index);
+}
+
+function getVisibleMessageIndices() {
+  const indices = [];
+  for (let i = 0; i < currentRenderedMessages.length; i += 1) {
+    if (messageMatchesFeedFilter(currentRenderedMessages[i])) {
+      indices.push(i);
+    }
+  }
+  return indices;
+}
+
+function jumpToAdjacentVisibleMessage(direction) {
+  const step = direction >= 0 ? 1 : -1;
+  const visibleIndices = getVisibleMessageIndices();
+  if (visibleIndices.length === 0) return;
+
+  const currentPos = visibleIndices.indexOf(activeEventMapIndex);
+  const seedPos = currentPos === -1 ? (step > 0 ? -1 : 0) : currentPos;
+  const nextPos = (seedPos + step + visibleIndices.length) % visibleIndices.length;
+  scrollToMessageIndex(visibleIndices[nextPos]);
+}
+
+function getEventMapMarkerType(message) {
+  if (messageHasSnapshots(message)) return 'snapshot';
+  if (messageHasTools(message)) return 'tool';
+  if (message && message.role === 'user') return 'user';
+  return 'assistant';
+}
+
+function renderEventMap(messages = []) {
+  const eventMap = document.getElementById('eventMap');
+  if (!eventMap) return;
+
+  if (!messages || messages.length === 0) {
+    activeEventMapIndex = -1;
+    eventMap.innerHTML = '<div class="event-map-empty">NO EVENT DATA</div>';
+    return;
+  }
+
+  const denominator = Math.max(1, messages.length - 1);
+  const markerMarkup = messages.map((message, index) => {
+    const top = messages.length === 1 ? 50 : (index / denominator) * 100;
+    const type = getEventMapMarkerType(message);
+    const flags = [
+      messageHasTools(message) ? 'has-tool' : '',
+      messageHasSnapshots(message) ? 'has-snapshot' : ''
+    ].filter(Boolean).join(' ');
+
+    return `
+      <button
+        type="button"
+        class="event-map-marker type-${type} ${flags}"
+        data-map-index="${index}"
+        style="top: ${top.toFixed(4)}%;"
+        aria-label="Jump to event ${index + 1}"
+      ></button>
+    `;
+  }).join('');
+
+  eventMap.innerHTML = `
+    <div class="event-map-track">
+      <div class="event-map-rail"></div>
+      ${markerMarkup}
+    </div>
+    <div class="event-map-meta">
+      <span>${messages.length} EVT</span>
+      <span id="eventMapFilterLabel">${getFeedFilterLabel(activeFeedFilter)}</span>
+    </div>
+  `;
+
+  eventMap.querySelectorAll('.event-map-marker').forEach(marker => {
+    marker.addEventListener('click', () => {
+      const index = Number.parseInt(marker.getAttribute('data-map-index') || '-1', 10);
+      if (!Number.isInteger(index) || index < 0) return;
+      scrollToMessageIndex(index);
+    });
+  });
+
+  updateEventMapFilterState();
+  updateActiveEventMapMarker();
+}
+
+function initializeEventMapTracking() {
+  const chatContainer = document.getElementById('chatContainer');
+  if (!chatContainer) return;
+
+  let rafId = null;
+  chatContainer.addEventListener('scroll', () => {
+    if (rafId !== null) return;
+    rafId = window.requestAnimationFrame(() => {
+      updateActiveEventMapMarker();
+      rafId = null;
+    });
+  });
+}
+
 function buildMessageSearchText(message) {
   const parts = [];
   if (message.role) parts.push(String(message.role));
@@ -366,6 +682,11 @@ function runEventSearch(options = {}) {
   eventSearchMatches = [];
 
   messageEls.forEach((el, index) => {
+    if (el.classList.contains('feed-hidden')) {
+      el.classList.remove('search-hit', 'search-dim', 'search-current');
+      return;
+    }
+
     const message = currentRenderedMessages[index];
     const haystack = message ? buildMessageSearchText(message) : '';
     const isMatch = haystack.includes(query);
@@ -583,6 +904,31 @@ function initializeKeyboardShortcuts() {
         eventSearchInput.focus();
         eventSearchInput.select();
       }
+    }
+
+    if (!isTypingInField && event.altKey && !event.metaKey && !event.ctrlKey) {
+      const filterFromKey = {
+        '1': 'all',
+        '2': 'user',
+        '3': 'assistant',
+        '4': 'tool',
+        '5': 'snapshot'
+      }[event.key];
+
+      if (filterFromKey) {
+        event.preventDefault();
+        setFeedFilter(filterFromKey, { announce: true });
+      }
+    }
+
+    if (!isTypingInField && event.key === '[') {
+      event.preventDefault();
+      jumpToAdjacentVisibleMessage(-1);
+    }
+
+    if (!isTypingInField && event.key === ']') {
+      event.preventDefault();
+      jumpToAdjacentVisibleMessage(1);
     }
   });
 }
@@ -998,9 +1344,20 @@ function renderGraphCanvas(messages = []) {
     const x = node.x - width / 2;
     const y = node.y - height / 2;
     const activeClass = node.active ? ' active' : '';
+    const selectedClass = isGraphNodeSelected(node.id) ? ' selected' : '';
+    const nodeFilter = getGraphNodeFeedFilter(node.id);
+    const nodeLabel = getFeedFilterLabel(nodeFilter);
 
     return `
-      <g class="graph-node${activeClass}" transform="translate(${x}, ${y})">
+      <g
+        class="graph-node${activeClass}${selectedClass}"
+        transform="translate(${x}, ${y})"
+        data-node-id="${escapeHtml(node.id)}"
+        data-node-filter="${escapeHtml(nodeFilter)}"
+        tabindex="0"
+        role="button"
+        aria-label="Apply ${escapeHtml(nodeLabel)} feed filter"
+      >
         <rect class="graph-node-panel" width="${width}" height="${height}"></rect>
         <line x1="0" y1="14" x2="${width}" y2="14" stroke="rgba(255,255,255,0.08)" />
         <text class="graph-node-glyph" x="8" y="11">${escapeHtml(node.glyph)}</text>
@@ -1025,6 +1382,30 @@ function renderGraphCanvas(messages = []) {
     <g class="graph-edges">${edgesMarkup}</g>
     <g class="graph-nodes">${nodesMarkup}</g>
   `;
+
+  attachGraphNodeHandlers();
+}
+
+function attachGraphNodeHandlers() {
+  const graphCanvas = document.getElementById('graphCanvas');
+  if (!graphCanvas) return;
+
+  graphCanvas.querySelectorAll('.graph-node[data-node-id]').forEach(nodeEl => {
+    const applyFilterFromNode = () => {
+      const nodeId = nodeEl.getAttribute('data-node-id');
+      if (!nodeId) return;
+      const filter = getGraphNodeFeedFilter(nodeId);
+      setFeedFilter(filter, { announce: true, preserveSearchIndex: false });
+    };
+
+    nodeEl.addEventListener('click', applyFilterFromNode);
+    nodeEl.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        applyFilterFromNode();
+      }
+    });
+  });
 }
 
 function renderFileHistorySnapshots(msg) {
@@ -1145,6 +1526,8 @@ async function loadSessions() {
       sessionList.innerHTML = `<div class="error-message">${result.error}</div>`;
       sessionCount.textContent = 'ERROR';
       setMetricValue('metricSessionCount', 0);
+      setMetricValue('metricVisibleEventCount', 0);
+      renderEventMap([]);
       return;
     }
 
@@ -1158,7 +1541,9 @@ async function loadSessions() {
       currentActiveSession = null;
       updateHeaderSession(null, 0);
       setMetricValue('metricEventCount', 0);
+      setMetricValue('metricVisibleEventCount', 0);
       renderGraphCanvas([]);
+      renderEventMap([]);
       setEventLogStatus('STANDBY');
       updateHeaderActionState();
       return;
@@ -1169,6 +1554,8 @@ async function loadSessions() {
     sessionList.innerHTML = `<div class="error-message">Error: ${error.message}</div>`;
     sessionCount.textContent = 'ERROR';
     setMetricValue('metricSessionCount', 0);
+    setMetricValue('metricVisibleEventCount', 0);
+    renderEventMap([]);
   } finally {
     isLoadingSessions = false;
   }
@@ -1216,6 +1603,8 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
     updateHeaderSession(currentActiveSession, currentRenderedMessages.length);
 
     chatContainer.innerHTML = currentRenderedMessages.map((msg, index) => {
+      const hasTools = messageHasTools(msg);
+      const hasSnapshots = messageHasSnapshots(msg);
       let contentHtml = '';
       if (msg.content) {
         contentHtml = marked.parse(msg.content);
@@ -1231,7 +1620,13 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
       const fileHistoryHtml = renderFileHistorySnapshots(msg);
 
       return `
-        <div class="message ${msg.role}" data-message-index="${index}">
+        <div
+          class="message ${msg.role}"
+          data-message-index="${index}"
+          data-role="${escapeHtml(msg.role || 'assistant')}"
+          data-has-tool="${hasTools ? '1' : '0'}"
+          data-has-snapshot="${hasSnapshots ? '1' : '0'}"
+        >
           <div class="message-header">
             <div class="message-role ${msg.role}">${msg.role === 'user' ? 'USER' : assistantName}</div>
             <div class="message-timestamp">${formatMessageTimestamp(msg.timestamp)}</div>
@@ -1245,7 +1640,9 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 
     attachFileHistoryHandlers(chatContainer);
     attachToolTraceHandlers(chatContainer);
-    runEventSearch({ preserveIndex: true, scroll: false });
+    renderEventMap(currentRenderedMessages);
+    renderGraphCanvas(currentRenderedMessages);
+    const visibleCount = applyFeedFilter({ runSearch: true, preserveSearchIndex: true });
     updateHeaderActionState();
     chatContainer.scrollTop = preserveScroll ? Math.min(prevScrollTop, chatContainer.scrollHeight) : 0;
 
@@ -1256,8 +1653,8 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
     setMetricValue('metricNodeCount', metrics.nodeCount);
     setMetricValue('metricRelationCount', metrics.relationCount);
     setMetricValue('metricEventCount', currentRenderedMessages.length);
-
-    renderGraphCanvas(currentRenderedMessages);
+    setMetricValue('metricVisibleEventCount', visibleCount);
+    updateActiveEventMapMarker();
     setEventLogStatus('LIVE', 'live');
   } catch (error) {
     chatContainer.innerHTML = `<div class="error-message">Error loading conversation: ${error.message}</div>`;
@@ -1269,15 +1666,20 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 
 window.addEventListener('DOMContentLoaded', () => {
   pinnedSessionKeys = loadPinnedSessionKeys();
+  activeFeedFilter = loadFeedFilterMode();
   initializeSidebarControls();
+  initializeFeedFilterControls();
   initializeEventSearchControls();
   initializeHeaderActions();
   initializeKeyboardShortcuts();
+  initializeEventMapTracking();
   initializeEventLogResizer();
   updateHeaderSession(null, 0);
   renderGraphCanvas([]);
+  renderEventMap([]);
   setMetricValue('metricSessionCount', 0);
   setMetricValue('metricEventCount', 0);
+  setMetricValue('metricVisibleEventCount', 0);
   setEventLogStatus('STANDBY');
 
   loadSessions();

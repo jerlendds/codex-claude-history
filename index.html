@@ -89,6 +89,7 @@
             <div class="metric-row"><span>RELATIONS</span><strong id="metricRelationCount">189</strong></div>
             <div class="metric-row"><span>SESSIONS</span><strong id="metricSessionCount">0</strong></div>
             <div class="metric-row"><span>EVENTS</span><strong id="metricEventCount">0</strong></div>
+            <div class="metric-row"><span>VISIBLE</span><strong id="metricVisibleEventCount">0</strong></div>
           </section>
 
           <section class="dock-panel entity-panel">
@@ -102,6 +103,11 @@
               <div class="entity-item"><span class="entity-glyph">PRJ</span><span class="entity-name">Project Path Anchor</span></div>
               <div class="entity-item"><span class="entity-glyph">TIM</span><span class="entity-name">Timestamp Timeline</span></div>
             </div>
+          </section>
+
+          <section class="dock-panel event-map-panel">
+            <div class="dock-title">EVENT MAP LANE</div>
+            <div class="event-map" id="eventMap" aria-label="Event map lane"></div>
           </section>
         </aside>
       </div>
@@ -119,6 +125,13 @@
         <div class="event-log-header">
           <span class="event-log-title">EVENT LOG FEED</span>
           <div class="event-log-tools">
+            <div class="feed-filter" id="feedFilter">
+              <button type="button" class="feed-filter-btn active" data-feed-filter="all">ALL</button>
+              <button type="button" class="feed-filter-btn" data-feed-filter="user">USR</button>
+              <button type="button" class="feed-filter-btn" data-feed-filter="assistant">AST</button>
+              <button type="button" class="feed-filter-btn" data-feed-filter="tool">TOOL</button>
+              <button type="button" class="feed-filter-btn" data-feed-filter="snapshot">SNAP</button>
+            </div>
             <input type="text" id="eventSearchInput" class="hud-input event-search-input" placeholder="SEARCH EVENTS..." autocomplete="off" />
             <button type="button" class="event-nav-btn" id="eventSearchPrev" aria-label="Previous match">▲</button>
             <button type="button" class="event-nav-btn" id="eventSearchNext" aria-label="Next match">▼</button>
