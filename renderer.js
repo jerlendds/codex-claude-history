@@ -1,4 +1,4 @@
-const { ipcRenderer } = require('electron');
+const { ipcRenderer, clipboard } = require('electron');
 const { marked } = require('marked');
 const hljs = require('highlight.js');
 
@@ -11,6 +11,16 @@ let isLoadingSessions = false;
 let isLoadingSessionDetails = false;
 const EVENT_LOG_HEIGHT_STORAGE_KEY = 'hud:event-log-height';
 const DEFAULT_EVENT_LOG_HEIGHT = 320;
+const PINNED_SESSIONS_STORAGE_KEY = 'hud:pinned-sessions';
+let currentActiveSession = null;
+let currentRenderedMessages = [];
+let sessionFilterQuery = '';
+let activeSourceFilter = 'all';
+let pinnedOnlyMode = false;
+let pinnedSessionKeys = new Set();
+let eventSearchMatches = [];
+let eventSearchCursor = -1;
+let statusResetTimeoutId = null;
 
 const BASE_GRAPH_NODES = [
   { id: 'session', label: 'Session File Root', glyph: 'SES', x: 148, y: 110 },
@@ -102,6 +112,479 @@ function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text == null ? '' : String(text);
   return div.innerHTML;
+}
+
+function getSessionStorageKey(session) {
+  const source = session && session.source ? session.source : 'claude';
+  const id = session && session.id ? session.id : '';
+  return `${source}:${id}`;
+}
+
+function loadPinnedSessionKeys() {
+  try {
+    const raw = localStorage.getItem(PINNED_SESSIONS_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter(value => typeof value === 'string' && value.trim()));
+  } catch (error) {
+    return new Set();
+  }
+}
+
+function persistPinnedSessionKeys() {
+  try {
+    localStorage.setItem(PINNED_SESSIONS_STORAGE_KEY, JSON.stringify([...pinnedSessionKeys]));
+  } catch (error) {
+    // Ignore local storage persistence issues.
+  }
+}
+
+function updateSourceFilterControls() {
+  document.querySelectorAll('.source-filter-btn[data-source-filter]').forEach(btn => {
+    const value = btn.getAttribute('data-source-filter');
+    if (value === 'pinned') {
+      btn.classList.toggle('active', pinnedOnlyMode);
+      return;
+    }
+
+    btn.classList.toggle('active', value === activeSourceFilter);
+  });
+}
+
+function initializeSidebarControls() {
+  const sessionSearchInput = document.getElementById('sessionSearchInput');
+  if (sessionSearchInput) {
+    sessionSearchInput.addEventListener('input', () => {
+      sessionFilterQuery = sessionSearchInput.value.trim().toLowerCase();
+      renderSessionList();
+    });
+  }
+
+  document.querySelectorAll('.source-filter-btn[data-source-filter]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const value = btn.getAttribute('data-source-filter');
+      if (!value) return;
+
+      if (value === 'pinned') {
+        pinnedOnlyMode = !pinnedOnlyMode;
+      } else {
+        activeSourceFilter = value;
+      }
+
+      updateSourceFilterControls();
+      renderSessionList();
+    });
+  });
+
+  updateSourceFilterControls();
+}
+
+function isSessionVisible(session) {
+  if (activeSourceFilter !== 'all' && (session.source || 'claude') !== activeSourceFilter) {
+    return false;
+  }
+
+  const key = getSessionStorageKey(session);
+  if (pinnedOnlyMode && !pinnedSessionKeys.has(key)) {
+    return false;
+  }
+
+  if (!sessionFilterQuery) return true;
+
+  const haystack = `${session.id || ''} ${session.display || ''} ${session.project || ''} ${session.source || ''}`.toLowerCase();
+  return haystack.includes(sessionFilterQuery);
+}
+
+function getVisibleSessions() {
+  const filtered = currentSessions.filter(isSessionVisible);
+  const pinned = [];
+  const regular = [];
+
+  for (const session of filtered) {
+    if (pinnedSessionKeys.has(getSessionStorageKey(session))) {
+      pinned.push(session);
+    } else {
+      regular.push(session);
+    }
+  }
+
+  return [...pinned, ...regular];
+}
+
+function renderSessionList() {
+  const sessionList = document.getElementById('sessionList');
+  const sessionCount = document.getElementById('sessionCount');
+  if (!sessionList || !sessionCount) return;
+
+  const visibleSessions = getVisibleSessions();
+
+  if (currentSessions.length === 0) {
+    sessionList.innerHTML = '<div class="loading">No sessions found</div>';
+    sessionCount.textContent = '0 sessions';
+    return;
+  }
+
+  if (visibleSessions.length === 0) {
+    sessionList.innerHTML = '<div class="loading">No sessions match filter</div>';
+    sessionCount.textContent = `0/${currentSessions.length} visible`;
+    return;
+  }
+
+  sessionCount.textContent = `${visibleSessions.length}/${currentSessions.length} visible`;
+
+  sessionList.innerHTML = visibleSessions.map(session => {
+    const priority = getSessionPriority(session);
+    const source = (session.source || 'claude').toUpperCase();
+    const preview = renderSessionPreviewMarkdown(session.display || 'No prompt captured');
+    const sessionKey = getSessionStorageKey(session);
+    const isPinned = pinnedSessionKeys.has(sessionKey);
+
+    return `
+      <div class="session-item" data-session-id="${session.id}" data-locator="${escapeHtml(session.locator || '')}" data-source="${escapeHtml(session.source || 'claude')}">
+        <div class="session-row">
+          <div class="session-timestamp">${formatTimestamp(session.timestamp)}</div>
+          <div class="session-row-meta">
+            <button type="button" class="session-pin ${isPinned ? 'pinned' : ''}" data-pin-key="${escapeHtml(sessionKey)}" aria-label="Pin session">*</button>
+            <div class="priority-badge ${priority.className}">${priority.label}</div>
+          </div>
+        </div>
+        <div class="session-preview">${preview}</div>
+        <div class="session-meta">
+          <div class="session-project">${escapeHtml(truncateProject(session.project))}</div>
+          <div class="session-messages">${session.messageCount} EVT • ${source}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  document.querySelectorAll('.session-pin').forEach(pinBtn => {
+    pinBtn.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const key = pinBtn.getAttribute('data-pin-key');
+      if (!key) return;
+
+      if (pinnedSessionKeys.has(key)) {
+        pinnedSessionKeys.delete(key);
+      } else {
+        pinnedSessionKeys.add(key);
+      }
+
+      persistPinnedSessionKeys();
+      renderSessionList();
+    });
+  });
+
+  document.querySelectorAll('.session-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const sessionId = item.getAttribute('data-session-id');
+      const locator = item.getAttribute('data-locator');
+      const source = item.getAttribute('data-source') || 'claude';
+
+      currentSessionLocator = locator;
+      loadSessionDetails(sessionId, locator, source);
+
+      document.querySelectorAll('.session-item').forEach(i => i.classList.remove('active'));
+      item.classList.add('active');
+    });
+  });
+
+  if (currentSessionId && currentSessionSource) {
+    const selected = document.querySelector(
+      `.session-item[data-session-id="${CSS.escape(currentSessionId)}"][data-source="${CSS.escape(currentSessionSource)}"]`
+    );
+    if (selected) selected.classList.add('active');
+  }
+}
+
+function buildMessageSearchText(message) {
+  const parts = [];
+  if (message.role) parts.push(String(message.role));
+  if (message.content) parts.push(String(message.content));
+  if (message.toolUses && message.toolUses.length > 0) {
+    for (const tool of message.toolUses) {
+      if (tool.name) parts.push(String(tool.name));
+      if (tool.command) parts.push(String(tool.command));
+      if (tool.payload) parts.push(String(tool.payload));
+    }
+  }
+  return parts.join('\n').toLowerCase();
+}
+
+function clearEventSearchClasses() {
+  document.querySelectorAll('#chatContainer .message').forEach(el => {
+    el.classList.remove('search-dim', 'search-hit', 'search-current');
+  });
+}
+
+function setEventSearchCount(current, total) {
+  const eventSearchCount = document.getElementById('eventSearchCount');
+  if (!eventSearchCount) return;
+  eventSearchCount.textContent = `${current}/${total}`;
+}
+
+function focusEventSearchMatch(index, options = {}) {
+  const { scroll = true } = options;
+  eventSearchMatches.forEach(el => el.classList.remove('search-current'));
+
+  if (eventSearchMatches.length === 0) {
+    eventSearchCursor = -1;
+    setEventSearchCount(0, 0);
+    return;
+  }
+
+  const safeIndex = ((index % eventSearchMatches.length) + eventSearchMatches.length) % eventSearchMatches.length;
+  eventSearchCursor = safeIndex;
+  const target = eventSearchMatches[safeIndex];
+  target.classList.add('search-current');
+
+  setEventSearchCount(safeIndex + 1, eventSearchMatches.length);
+
+  if (scroll) {
+    target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+}
+
+function runEventSearch(options = {}) {
+  const { preserveIndex = false, scroll = false } = options;
+  const input = document.getElementById('eventSearchInput');
+  if (!input) return;
+
+  const query = input.value.trim().toLowerCase();
+  const messageEls = [...document.querySelectorAll('#chatContainer .message')];
+
+  if (!query) {
+    eventSearchMatches = [];
+    eventSearchCursor = -1;
+    clearEventSearchClasses();
+    setEventSearchCount(0, 0);
+    return;
+  }
+
+  eventSearchMatches = [];
+
+  messageEls.forEach((el, index) => {
+    const message = currentRenderedMessages[index];
+    const haystack = message ? buildMessageSearchText(message) : '';
+    const isMatch = haystack.includes(query);
+
+    el.classList.toggle('search-hit', isMatch);
+    el.classList.toggle('search-dim', !isMatch);
+    el.classList.remove('search-current');
+
+    if (isMatch) eventSearchMatches.push(el);
+  });
+
+  if (eventSearchMatches.length === 0) {
+    eventSearchCursor = -1;
+    setEventSearchCount(0, 0);
+    return;
+  }
+
+  const nextIndex = preserveIndex && eventSearchCursor >= 0 ? eventSearchCursor : 0;
+  focusEventSearchMatch(nextIndex, { scroll });
+}
+
+function initializeEventSearchControls() {
+  const input = document.getElementById('eventSearchInput');
+  const prevBtn = document.getElementById('eventSearchPrev');
+  const nextBtn = document.getElementById('eventSearchNext');
+
+  if (input) {
+    input.addEventListener('input', () => runEventSearch({ preserveIndex: false, scroll: false }));
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        if (event.shiftKey) {
+          focusEventSearchMatch(eventSearchCursor - 1);
+        } else {
+          focusEventSearchMatch(eventSearchCursor + 1);
+        }
+      }
+    });
+  }
+
+  if (prevBtn) {
+    prevBtn.addEventListener('click', () => focusEventSearchMatch(eventSearchCursor - 1));
+  }
+
+  if (nextBtn) {
+    nextBtn.addEventListener('click', () => focusEventSearchMatch(eventSearchCursor + 1));
+  }
+}
+
+function buildSessionFilename(extension) {
+  const session = currentActiveSession;
+  if (!session) return `conversation-export.${extension}`;
+
+  const source = (session.source || currentSessionSource || 'session').toString().toLowerCase();
+  const id = (session.id || currentSessionId || 'export').toString().replace(/[^a-zA-Z0-9_-]+/g, '-').slice(0, 28);
+  const date = session.timestamp ? new Date(session.timestamp) : new Date();
+  const stamp = Number.isNaN(date.getTime())
+    ? 'unknown'
+    : `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}-${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}${String(date.getSeconds()).padStart(2, '0')}`;
+
+  return `${source}-${id}-${stamp}.${extension}`;
+}
+
+function buildConversationMarkdown(session, messages) {
+  const lines = [];
+  const title = session && session.display ? session.display : 'Conversation Export';
+  lines.push(`# ${title}`);
+  lines.push('');
+  lines.push(`- Source: ${(session && session.source) || currentSessionSource || 'unknown'}`);
+  lines.push(`- Session ID: ${(session && session.id) || currentSessionId || 'unknown'}`);
+  lines.push(`- Project: ${(session && session.project) || 'unknown/project'}`);
+  lines.push(`- Exported: ${new Date().toISOString()}`);
+  lines.push('');
+
+  messages.forEach((msg, index) => {
+    lines.push(`## ${index + 1}. ${msg.role === 'user' ? 'User' : (currentSessionSource === 'codex' ? 'Codex' : 'Claude')}`);
+    lines.push(`Timestamp: ${msg.timestamp ? formatMessageTimestamp(msg.timestamp) : 'N/A'}`);
+    lines.push('');
+
+    if (msg.content && msg.content.trim()) {
+      lines.push(msg.content.trim());
+      lines.push('');
+    }
+
+    if (msg.toolUses && msg.toolUses.length > 0) {
+      lines.push('Tool Trace:');
+      lines.push('');
+
+      msg.toolUses.forEach((tool, toolIndex) => {
+        lines.push(`- ${toolIndex + 1}. ${tool.name || 'tool'}`);
+        if (tool.command && tool.command.trim()) {
+          lines.push('```text');
+          lines.push(tool.command.trim());
+          lines.push('```');
+        }
+        if (tool.payload && String(tool.payload).trim()) {
+          lines.push('```text');
+          lines.push(String(tool.payload).trim());
+          lines.push('```');
+        }
+      });
+
+      lines.push('');
+    }
+  });
+
+  return lines.join('\n');
+}
+
+function buildConversationJson(session, messages) {
+  return JSON.stringify({
+    exportedAt: new Date().toISOString(),
+    session: {
+      id: (session && session.id) || currentSessionId || null,
+      source: (session && session.source) || currentSessionSource || null,
+      project: (session && session.project) || null,
+      title: (session && session.display) || null,
+      timestamp: (session && session.timestamp) || null
+    },
+    messages
+  }, null, 2);
+}
+
+function downloadTextFile(filename, text, mimeType = 'text/plain') {
+  const blob = new Blob([text], { type: `${mimeType};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 500);
+}
+
+function setTransientStatus(label, mode = 'live', ms = 1200) {
+  if (statusResetTimeoutId) clearTimeout(statusResetTimeoutId);
+  setEventLogStatus(label, mode);
+  statusResetTimeoutId = setTimeout(() => {
+    if (currentSessionId) {
+      setEventLogStatus('LIVE', 'live');
+    } else {
+      setEventLogStatus('STANDBY');
+    }
+    statusResetTimeoutId = null;
+  }, ms);
+}
+
+function updateHeaderActionState() {
+  const disabled = !currentActiveSession || currentRenderedMessages.length === 0;
+  ['copyMarkdownBtn', 'copyJsonBtn', 'exportMarkdownBtn'].forEach(id => {
+    const btn = document.getElementById(id);
+    if (btn) btn.disabled = disabled;
+  });
+}
+
+function initializeHeaderActions() {
+  const copyMarkdownBtn = document.getElementById('copyMarkdownBtn');
+  const copyJsonBtn = document.getElementById('copyJsonBtn');
+  const exportMarkdownBtn = document.getElementById('exportMarkdownBtn');
+
+  if (copyMarkdownBtn) {
+    copyMarkdownBtn.addEventListener('click', () => {
+      if (!currentActiveSession || currentRenderedMessages.length === 0) return;
+      const markdown = buildConversationMarkdown(currentActiveSession, currentRenderedMessages);
+      clipboard.writeText(markdown);
+      setTransientStatus('COPIED MD', 'live');
+    });
+  }
+
+  if (copyJsonBtn) {
+    copyJsonBtn.addEventListener('click', () => {
+      if (!currentActiveSession || currentRenderedMessages.length === 0) return;
+      const json = buildConversationJson(currentActiveSession, currentRenderedMessages);
+      clipboard.writeText(json);
+      setTransientStatus('COPIED JSON', 'live');
+    });
+  }
+
+  if (exportMarkdownBtn) {
+    exportMarkdownBtn.addEventListener('click', () => {
+      if (!currentActiveSession || currentRenderedMessages.length === 0) return;
+      const markdown = buildConversationMarkdown(currentActiveSession, currentRenderedMessages);
+      const filename = buildSessionFilename('md');
+      downloadTextFile(filename, markdown, 'text/markdown');
+      setTransientStatus('EXPORTED MD', 'live');
+    });
+  }
+
+  updateHeaderActionState();
+}
+
+function initializeKeyboardShortcuts() {
+  window.addEventListener('keydown', event => {
+    const target = event.target;
+    const isTypingInField = target && (
+      target.tagName === 'INPUT' ||
+      target.tagName === 'TEXTAREA' ||
+      target.isContentEditable
+    );
+
+    if (!isTypingInField && event.key === '/') {
+      const sessionSearchInput = document.getElementById('sessionSearchInput');
+      if (sessionSearchInput) {
+        event.preventDefault();
+        sessionSearchInput.focus();
+        sessionSearchInput.select();
+      }
+    }
+
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+      const eventSearchInput = document.getElementById('eventSearchInput');
+      if (eventSearchInput) {
+        event.preventDefault();
+        eventSearchInput.focus();
+        eventSearchInput.select();
+      }
+    }
+  });
 }
 
 function renderSessionPreviewMarkdown(text) {
@@ -671,55 +1154,17 @@ async function loadSessions() {
     if (currentSessions.length === 0) {
       sessionList.innerHTML = '<div class="loading">No sessions found</div>';
       sessionCount.textContent = '0 sessions';
+      currentRenderedMessages = [];
+      currentActiveSession = null;
       updateHeaderSession(null, 0);
       setMetricValue('metricEventCount', 0);
       renderGraphCanvas([]);
       setEventLogStatus('STANDBY');
+      updateHeaderActionState();
       return;
     }
 
-    sessionCount.textContent = `${currentSessions.length} session${currentSessions.length !== 1 ? 's' : ''} indexed`;
-
-    sessionList.innerHTML = currentSessions.map(session => {
-      const priority = getSessionPriority(session);
-      const source = (session.source || 'claude').toUpperCase();
-      const preview = renderSessionPreviewMarkdown(session.display || 'No prompt captured');
-
-      return `
-        <div class="session-item" data-session-id="${session.id}" data-locator="${escapeHtml(session.locator || '')}" data-source="${escapeHtml(session.source || 'claude')}">
-          <div class="session-row">
-            <div class="session-timestamp">${formatTimestamp(session.timestamp)}</div>
-            <div class="priority-badge ${priority.className}">${priority.label}</div>
-          </div>
-          <div class="session-preview">${preview}</div>
-          <div class="session-meta">
-            <div class="session-project">${escapeHtml(truncateProject(session.project))}</div>
-            <div class="session-messages">${session.messageCount} EVT • ${source}</div>
-          </div>
-        </div>
-      `;
-    }).join('');
-
-    document.querySelectorAll('.session-item').forEach(item => {
-      item.addEventListener('click', () => {
-        const sessionId = item.getAttribute('data-session-id');
-        const locator = item.getAttribute('data-locator');
-        const source = item.getAttribute('data-source') || 'claude';
-
-        currentSessionLocator = locator;
-        loadSessionDetails(sessionId, locator, source);
-
-        document.querySelectorAll('.session-item').forEach(i => i.classList.remove('active'));
-        item.classList.add('active');
-      });
-    });
-
-    if (currentSessionId && currentSessionSource) {
-      const selected = document.querySelector(
-        `.session-item[data-session-id="${CSS.escape(currentSessionId)}"][data-source="${CSS.escape(currentSessionSource)}"]`
-      );
-      if (selected) selected.classList.add('active');
-    }
+    renderSessionList();
   } catch (error) {
     sessionList.innerHTML = `<div class="error-message">Error: ${error.message}</div>`;
     sessionCount.textContent = 'ERROR';
@@ -758,10 +1203,19 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 
     const session = currentSessions.find(s => s.id === sessionId && (s.source || 'claude') === currentSessionSource);
     const assistantName = currentSessionSource === 'codex' ? 'CODEX' : 'CLAUDE';
+    currentActiveSession = session || {
+      id: sessionId,
+      source: currentSessionSource,
+      locator,
+      timestamp: Date.now(),
+      display: '',
+      project: ''
+    };
+    currentRenderedMessages = result.messages || [];
 
-    updateHeaderSession(session, result.messages.length);
+    updateHeaderSession(currentActiveSession, currentRenderedMessages.length);
 
-    chatContainer.innerHTML = result.messages.map(msg => {
+    chatContainer.innerHTML = currentRenderedMessages.map((msg, index) => {
       let contentHtml = '';
       if (msg.content) {
         contentHtml = marked.parse(msg.content);
@@ -777,7 +1231,7 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
       const fileHistoryHtml = renderFileHistorySnapshots(msg);
 
       return `
-        <div class="message ${msg.role}">
+        <div class="message ${msg.role}" data-message-index="${index}">
           <div class="message-header">
             <div class="message-role ${msg.role}">${msg.role === 'user' ? 'USER' : assistantName}</div>
             <div class="message-timestamp">${formatMessageTimestamp(msg.timestamp)}</div>
@@ -791,17 +1245,19 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 
     attachFileHistoryHandlers(chatContainer);
     attachToolTraceHandlers(chatContainer);
+    runEventSearch({ preserveIndex: true, scroll: false });
+    updateHeaderActionState();
     chatContainer.scrollTop = preserveScroll ? Math.min(prevScrollTop, chatContainer.scrollHeight) : 0;
 
-    const toolCount = countToolUses(result.messages);
-    const snapshotCount = countSnapshots(result.messages);
-    const metrics = deriveTelemetryMetrics(result.messages.length, toolCount, snapshotCount);
+    const toolCount = countToolUses(currentRenderedMessages);
+    const snapshotCount = countSnapshots(currentRenderedMessages);
+    const metrics = deriveTelemetryMetrics(currentRenderedMessages.length, toolCount, snapshotCount);
 
     setMetricValue('metricNodeCount', metrics.nodeCount);
     setMetricValue('metricRelationCount', metrics.relationCount);
-    setMetricValue('metricEventCount', result.messages.length);
+    setMetricValue('metricEventCount', currentRenderedMessages.length);
 
-    renderGraphCanvas(result.messages);
+    renderGraphCanvas(currentRenderedMessages);
     setEventLogStatus('LIVE', 'live');
   } catch (error) {
     chatContainer.innerHTML = `<div class="error-message">Error loading conversation: ${error.message}</div>`;
@@ -812,6 +1268,11 @@ async function loadSessionDetails(sessionId, locator, source, options = {}) {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
+  pinnedSessionKeys = loadPinnedSessionKeys();
+  initializeSidebarControls();
+  initializeEventSearchControls();
+  initializeHeaderActions();
+  initializeKeyboardShortcuts();
   initializeEventLogResizer();
   updateHeaderSession(null, 0);
   renderGraphCanvas([]);

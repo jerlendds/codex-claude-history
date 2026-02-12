@@ -14,6 +14,15 @@
         <div class="sidebar-eyebrow">SESSION ARCHIVE INDEX</div>
         <h1>Claude + Codex History</h1>
         <div class="session-count" id="sessionCount">Loading...</div>
+        <div class="sidebar-controls">
+          <input type="text" id="sessionSearchInput" class="hud-input" placeholder="FILTER SESSIONS..." autocomplete="off" />
+          <div class="source-filter" id="sourceFilter">
+            <button type="button" class="source-filter-btn active" data-source-filter="all">ALL</button>
+            <button type="button" class="source-filter-btn" data-source-filter="claude">CLAUDE</button>
+            <button type="button" class="source-filter-btn" data-source-filter="codex">CODEX</button>
+            <button type="button" class="source-filter-btn" id="pinnedOnlyBtn" data-source-filter="pinned">PINNED</button>
+          </div>
+        </div>
       </div>
       <div class="session-list" id="sessionList">
         <div class="loading">Loading sessions...</div>
@@ -26,6 +35,11 @@
           <div class="header-eyebrow">AI COMMAND CONSOLE // SESSION TELEMETRY GRID</div>
           <div class="session-title" id="headerSessionTitle" data-ghost="NO ACTIVE SESSION">NO ACTIVE SESSION</div>
           <div class="session-info" id="headerSessionInfo">Select a session to begin timeline replay and telemetry.</div>
+          <div class="header-actions">
+            <button type="button" class="hud-action-btn" id="copyMarkdownBtn">COPY MD</button>
+            <button type="button" class="hud-action-btn" id="copyJsonBtn">COPY JSON</button>
+            <button type="button" class="hud-action-btn" id="exportMarkdownBtn">EXPORT MD</button>
+          </div>
         </div>
 
         <div class="header-analytics" aria-hidden="true">
@@ -103,7 +117,13 @@
 
       <section class="event-log-panel">
         <div class="event-log-header">
-          <span>EVENT LOG FEED</span>
+          <span class="event-log-title">EVENT LOG FEED</span>
+          <div class="event-log-tools">
+            <input type="text" id="eventSearchInput" class="hud-input event-search-input" placeholder="SEARCH EVENTS..." autocomplete="off" />
+            <button type="button" class="event-nav-btn" id="eventSearchPrev" aria-label="Previous match">▲</button>
+            <button type="button" class="event-nav-btn" id="eventSearchNext" aria-label="Next match">▼</button>
+            <span class="event-search-count" id="eventSearchCount">0/0</span>
+          </div>
           <span class="event-log-status" id="eventLogStatus">STANDBY</span>
         </div>
         <div class="chat-container" id="chatContainer">
